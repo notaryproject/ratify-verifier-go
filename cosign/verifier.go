@@ -96,10 +96,6 @@ type VerifierOptions struct {
 	// TUFOptions provides custom TUF client options for fetching trusted root.
 	// Optional.
 	TUFOptions *tuf.Options
-
-	// RekorURL is the URL of the Rekor transparency log server.
-	// Optional. Defaults to https://rekor.sigstore.dev if not provided.
-	RekorURL string
 }
 
 // Verifier is a ratify.Verifier implementation that verifies Cosign signatures.
@@ -115,10 +111,6 @@ type Verifier struct {
 func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 	if opts.Name == "" {
 		return nil, fmt.Errorf("verifier name is required")
-	}
-
-	if opts.RekorURL == "" {
-		opts.RekorURL = "https://rekor.sigstore.dev"
 	}
 
 	var trustedMaterial root.TrustedMaterial
@@ -228,7 +220,7 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 		cosignExtension := make(map[string]string)
 		cosignExtension["digest"] = layer.Digest.String()
 		if res, err := v.verifySignatureLayer(layer); err != nil {
-			cosignExtension["error"] = fmt.Sprintf("signature verification failed: %w", err)
+			cosignExtension["error"] = fmt.Sprintf("signature verification failed: %s", err)
 			cosignExtension["succeeded"] = "false"
 		} else {
 			validSigFound = true
@@ -406,7 +398,7 @@ func getBundleMsgSignature(simpleSigningLayer ocispec.Descriptor) (*protobundle.
 	case "sha256":
 		msgHashAlg = protocommon.HashAlgorithm_SHA2_256
 	default:
-		return nil, fmt.Errorf("unknown digest algorithm: %s", simpleSigningLayer.Digest.Algorithm)
+		return nil, fmt.Errorf("unknown digest algorithm: %s", simpleSigningLayer.Digest.Algorithm())
 	}
 	// 2. Get the message digest
 	digest, err := hex.DecodeString(simpleSigningLayer.Digest.Encoded())
