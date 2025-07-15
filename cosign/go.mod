@@ -1,9 +1,10 @@
 module github.com/binbin-li/ratify-verifier-go/cosign
 
-go 1.23.0
+go 1.24.0
 
 require (
-	github.com/notaryproject/ratify-go v0.0.0-20250523033553-c475c86f66c4
+	github.com/notaryproject/ratify-go v0.0.0-20250717032624-af22764f1472
+	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/sigstore/protobuf-specs v0.4.1
 	github.com/sigstore/sigstore v1.9.4
@@ -45,7 +46,6 @@ require (
 	github.com/mailru/easyjson v0.9.0 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/oklog/ulid v1.3.1 // indirect
-	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.3 // indirect
 	github.com/pkg/errors v0.9.1 // indirect

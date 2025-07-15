@@ -40,9 +40,13 @@ import (
 )
 
 const (
-	cosignVerifierType        = "cosign"
-	cosignSignatureArtifact   = "application/vnd.dev.cosign.artifact.sig.v1+json"
+	verifierTypeCosign        = "cosign"
+	signatureArtifactCosign   = "application/vnd.dev.cosign.artifact.sig.v1+json"
 	sigstoreBundleMediaType01 = "application/vnd.dev.sigstore.bundle+json;version=0.1"
+	annotationKeyBundle       = "dev.sigstore.cosign/bundle"
+	AnnotationKeyCert         = "dev.sigstore.cosign/certificate"
+	annotationKeySignature    = "dev.cosignproject.cosign/signature"
+	mediaTypeSimpleSigning    = "application/vnd.dev.cosign.simplesigning.v1+json"
 )
 
 // PublicKeyConfig contains the configuration for key-based verification.
@@ -54,12 +58,14 @@ type PublicKeyConfig struct {
 	// Optional. If not provided, defaults to SHA256.
 	SignatureAlgorithm crypto.Hash
 
-	// ValidityPeriodStart defines the start time for the public key validity period.
-	// Optional. If not provided, the key is considered valid from the beginning of time.
+	// ValidityPeriodStart defines the start time for the public key validity
+	// period. Optional. If not provided, the key is considered valid from the
+	// beginning of time.
 	ValidityPeriodStart time.Time
 
 	// ValidityPeriodEnd defines the end time for the public key validity period.
-	// Optional. If not provided, the key is considered valid until the end of time.
+	// Optional. If not provided, the key is considered valid until the end of
+	// time.
 	ValidityPeriodEnd time.Time
 }
 
@@ -75,7 +81,7 @@ type VerifierOptions struct {
 
 	// PublicKeyConfig contains the public key and its validity period for key-based verification.
 	// If provided, key-based verification will be performed. Optional.
-	PublicKeyConfig *PublicKeyConfig
+	PublicKeyConfigs []*PublicKeyConfig
 
 	// IdentityPolicies contains policies for keyless verification.
 	// These policies specify which OIDC identities are trusted. Optional.
@@ -84,10 +90,6 @@ type VerifierOptions struct {
 	// IgnoreTlog when set to true, skips Artifact transparency log verification.
 	// Only applies to keyless verification. Optional, defaults to false.
 	IgnoreTlog bool
-
-	// RequireTimestamp when set to true, requires signed timestamps.
-	// Only applies to keyless verification. Optional, defaults to false.
-	RequireTimestamp bool
 
 	// IgnoreCTLog when set to true, skips certificate transparency log verification.
 	// Only applies to keyless verification. Optional, defaults to false.
@@ -103,7 +105,6 @@ type Verifier struct {
 	name             string
 	identityPolicies []verify.PolicyOption
 	ignoreTlog       bool
-	requireTimestamp bool
 	verifier         *verify.Verifier
 }
 
@@ -113,36 +114,38 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 		return nil, fmt.Errorf("verifier name is required")
 	}
 
-	var trustedMaterial root.TrustedMaterial
+	trustedMaterial := make(root.TrustedMaterialCollection, 0)
 
-	if opts.PublicKeyConfig != nil {
-		// Key-based verification: create trusted material with the public key
-		if opts.PublicKeyConfig.SignatureAlgorithm == 0 {
+	// Key-based verification: create trusted material with the public keys
+	for _, config := range opts.PublicKeyConfigs {
+		if config == nil {
+			return nil, fmt.Errorf("public key config cannot be nil")
+		}
+		if config.SignatureAlgorithm == 0 {
 			// Default to SHA256 if no algorithm is specified
-			opts.PublicKeyConfig.SignatureAlgorithm = crypto.SHA256
+			config.SignatureAlgorithm = crypto.SHA256
 		}
-		trustedMaterial = createTrustedPublicKeyMaterial(opts.PublicKeyConfig)
-	} else {
-		// Keyless verification: use provided trusted root or fetch from TUF
-		if opts.TrustedRoot != nil {
-			trustedMaterial = opts.TrustedRoot
-		} else {
-			// Fetch default Sigstore trusted root
-			var tufClient *tuf.Client
-			var err error
-			if opts.TUFOptions == nil {
-				opts.TUFOptions = tuf.DefaultOptions()
-			}
-			if tufClient, err = tuf.New(opts.TUFOptions); err != nil {
-				return nil, fmt.Errorf("failed to create TUF client: %w", err)
-			}
+		trustedMaterial = append(trustedMaterial, createTrustedPublicKeyMaterial(config))
+	}
 
-			trustedRoot, err := root.GetTrustedRoot(tufClient)
-			if err != nil {
-				return nil, fmt.Errorf("failed to fetch trusted root: %w", err)
-			}
-			trustedMaterial = trustedRoot
+	// Keyless verification: use provided trusted root or fetch from TUF
+	if opts.TrustedRoot != nil {
+		trustedMaterial = append(trustedMaterial, opts.TrustedRoot)
+	} else {
+		// Fetch default Sigstore trusted root
+		if opts.TUFOptions == nil {
+			opts.TUFOptions = tuf.DefaultOptions()
 		}
+		tufClient, err := tuf.New(opts.TUFOptions)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create TUF client: %w", err)
+		}
+
+		trustedRoot, err := root.GetTrustedRoot(tufClient)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch trusted root: %w", err)
+		}
+		trustedMaterial = append(trustedMaterial, trustedRoot)
 	}
 
 	// Create verifier options for signature verification
@@ -154,15 +157,14 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 	}
 
 	// Configure timestamp verification
-	if opts.RequireTimestamp {
-		verifierOpts = append(verifierOpts, verify.WithSignedTimestamps(1))
-	}
+	verifierOpts = append(verifierOpts, verify.WithObserverTimestamps(1))
 
 	// Configure certificate transparency log verification
 	if !opts.IgnoreCTLog {
 		verifierOpts = append(verifierOpts, verify.WithSignedCertificateTimestamps(1))
 	}
 
+	// Create the underlying cosign verifier
 	v, err := verify.NewVerifier(trustedMaterial, verifierOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create verifier: %w", err)
@@ -172,7 +174,6 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 		name:             opts.Name,
 		identityPolicies: opts.IdentityPolicies,
 		ignoreTlog:       opts.IgnoreTlog,
-		requireTimestamp: opts.RequireTimestamp,
 		verifier:         v,
 	}, nil
 }
@@ -184,16 +185,17 @@ func (v *Verifier) Name() string {
 
 // Type returns the type of the verifier which is always `cosign`.
 func (v *Verifier) Type() string {
-	return cosignVerifierType
+	return verifierTypeCosign
 }
 
 // Verifiable returns true if the artifact is a Cosign signature.
 func (v *Verifier) Verifiable(artifact ocispec.Descriptor) bool {
-	return artifact.ArtifactType == cosignSignatureArtifact &&
+	return artifact.ArtifactType == signatureArtifactCosign &&
 		artifact.MediaType == ocispec.MediaTypeImageManifest
 }
 
-// Verify verifies the Cosign signature.
+// Verify verifies the artifact containing Cosign signatures.
+// The verification passes if at least one valid signature is found.
 func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*ratify.VerificationResult, error) {
 	sigManifestBytes, err := opts.Store.FetchManifest(ctx, opts.Repository, opts.ArtifactDescriptor)
 	if err != nil {
@@ -206,32 +208,35 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 	}
 
 	// Get signature descriptors of simple signing layers
-	layers, err := v.getSignatureDescriptors(ctx, opts.Store, opts.Repository, opts.ArtifactDescriptor)
+	layers, err := getSignatureDescriptors(ctx, opts.Store, opts.Repository, opts.ArtifactDescriptor)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get signature descriptors: %w", err)
 	}
 
 	validSigFound := false
-	var cosignExtensions []map[string]string
-	result := &ratify.VerificationResult{
-		Verifier: v,
-	}
+	var reports []*layerReport
+
 	for _, layer := range layers {
-		cosignExtension := make(map[string]string)
-		cosignExtension["digest"] = layer.Digest.String()
+		report := &layerReport{
+			Digest: layer.Digest.String(),
+		}
 		if res, err := v.verifySignatureLayer(layer); err != nil {
-			cosignExtension["error"] = fmt.Sprintf("signature verification failed: %s", err)
-			cosignExtension["succeeded"] = "false"
+			report.Error = err
+			report.Succeeded = false
 		} else {
 			validSigFound = true
-			cosignExtension["succeeded"] = "true"
-			cosignExtension["verificationResult"] = fmt.Sprintf("%+v", res)
+			report.Succeeded = true
+			report.VerificationResult = res
 		}
-
-		cosignExtensions = append(cosignExtensions, cosignExtension)
+		reports = append(reports, report)
 	}
 
-	result.Detail = cosignExtensions
+	result := &ratify.VerificationResult{
+		Verifier: v,
+		Detail: map[string][]*layerReport{
+			"verifiedSignatures": reports,
+		},
+	}
 	if validSigFound {
 		result.Description = "Cosign signature verification succeeded"
 	} else {
@@ -240,9 +245,10 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 	return result, nil
 }
 
+// verifySignatureLayer verifies a single simple signing layer.
 func (v *Verifier) verifySignatureLayer(manifestLayer ocispec.Descriptor) (*verify.VerificationResult, error) {
 	// Build the verification material for the bundle
-	verificationMaterial, err := v.getBundleVerificationMaterial(manifestLayer)
+	verificationMaterial, err := getBundleVerificationMaterial(manifestLayer, v.ignoreTlog)
 	if err != nil {
 		return nil, fmt.Errorf("error getting verification material: %v", err)
 	}
@@ -264,16 +270,24 @@ func (v *Verifier) verifySignatureLayer(manifestLayer ocispec.Descriptor) (*veri
 		return nil, fmt.Errorf("error creating bundle: %v", err)
 	}
 
-	verificationResult, err := v.performVerification(bun, manifestLayer.Digest)
-	if err != nil {
-		return nil, fmt.Errorf("bundle verification failed: %v", err)
-	}
-
-	return verificationResult, nil
+	return v.verifyBundle(bun, manifestLayer.Digest)
 }
 
-// getBundleVerificationMaterial returns the bundle verification material from the simple signing layer
-func (v *Verifier) getBundleVerificationMaterial(manifestLayer ocispec.Descriptor) (*protobundle.VerificationMaterial, error) {
+// verifyBundle verifies the bundle using the configured verifier.
+func (v *Verifier) verifyBundle(bundleObj *bundle.Bundle, layer digest.Digest) (*verify.VerificationResult, error) {
+	digestBytes, err := hex.DecodeString(layer.Encoded())
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode digest hex: %w", err)
+	}
+
+	// Create artifact policy
+	artifactPolicy := verify.WithArtifactDigest(string(layer.Algorithm()), digestBytes)
+	return v.verifier.Verify(bundleObj, verify.NewPolicy(artifactPolicy, v.identityPolicies...))
+}
+
+// getBundleVerificationMaterial returns the bundle verification material from
+// the simple signing layer
+func getBundleVerificationMaterial(manifestLayer ocispec.Descriptor, ignoreTlog bool) (*protobundle.VerificationMaterial, error) {
 	// 1. Get the signing certificate chain
 	signingCert, err := getVerificationMaterialX509CertificateChain(manifestLayer)
 	if err != nil {
@@ -282,7 +296,7 @@ func (v *Verifier) getBundleVerificationMaterial(manifestLayer ocispec.Descripto
 
 	// 2. Get the transparency log entries
 	var tlogEntries []*protorekor.TransparencyLogEntry
-	if !v.ignoreTlog {
+	if !ignoreTlog {
 		tlogEntries, err = getVerificationMaterialTlogEntries(manifestLayer)
 		if err != nil {
 			return nil, fmt.Errorf("error getting tlog entries: %w", err)
@@ -297,12 +311,11 @@ func (v *Verifier) getBundleVerificationMaterial(manifestLayer ocispec.Descripto
 	}, nil
 }
 
-// getVerificationMaterialX509CertificateChain returns the verification material X509 certificate chain from the
-// simple signing layer
-func getVerificationMaterialX509CertificateChain(manifestLayer ocispec.Descriptor) (
-	*protobundle.VerificationMaterial_X509CertificateChain, error) {
+// getVerificationMaterialX509CertificateChain returns the verification material
+// X509 certificate chain from the simple signing layer
+func getVerificationMaterialX509CertificateChain(manifestLayer ocispec.Descriptor) (*protobundle.VerificationMaterial_X509CertificateChain, error) {
 	// 1. Get the PEM certificate from the simple signing layer
-	pemCert := manifestLayer.Annotations["dev.sigstore.cosign/certificate"]
+	pemCert := manifestLayer.Annotations[AnnotationKeyCert]
 	// 2. Construct the DER encoded version of the PEM certificate
 	block, _ := pem.Decode([]byte(pemCert))
 	if block == nil {
@@ -322,19 +335,37 @@ func getVerificationMaterialX509CertificateChain(manifestLayer ocispec.Descripto
 // getVerificationMaterialTlogEntries returns the verification material transparency log entries from the simple signing layer
 func getVerificationMaterialTlogEntries(manifestLayer ocispec.Descriptor) ([]*protorekor.TransparencyLogEntry, error) {
 	// 1. Get the bundle annotation
-	bun := manifestLayer.Annotations["dev.sigstore.cosign/bundle"]
-	var jsonData map[string]interface{}
+	if manifestLayer.Annotations == nil {
+		return nil, fmt.Errorf("manifest layer annotations are nil")
+	}
+	bun, exists := manifestLayer.Annotations[annotationKeyBundle]
+	if !exists {
+		return nil, fmt.Errorf("bundle annotation not found")
+	}
+	if bun == "" {
+		return nil, fmt.Errorf("bundle annotation is empty")
+	}
+
+	var jsonData map[string]any
 	err := json.Unmarshal([]byte(bun), &jsonData)
 	if err != nil {
 		return nil, fmt.Errorf("error unmarshaling json: %w", err)
 	}
+	if jsonData == nil {
+		return nil, fmt.Errorf("unmarshaled json data is nil")
+	}
 
 	// 2. Get the log index, log ID, integrated time, signed entry timestamp and body
-	logIndex, ok := jsonData["Payload"].(map[string]interface{})["logIndex"].(float64)
+	payload, ok := jsonData["Payload"].(map[string]any)
+	if !ok || payload == nil {
+		return nil, fmt.Errorf("error getting Payload")
+	}
+
+	logIndex, ok := payload["logIndex"].(float64)
 	if !ok {
 		return nil, fmt.Errorf("error getting logIndex")
 	}
-	li, ok := jsonData["Payload"].(map[string]interface{})["logID"].(string)
+	li, ok := payload["logID"].(string)
 	if !ok {
 		return nil, fmt.Errorf("error getting logID")
 	}
@@ -342,7 +373,7 @@ func getVerificationMaterialTlogEntries(manifestLayer ocispec.Descriptor) ([]*pr
 	if err != nil {
 		return nil, fmt.Errorf("error decoding logID: %w", err)
 	}
-	integratedTime, ok := jsonData["Payload"].(map[string]interface{})["integratedTime"].(float64)
+	integratedTime, ok := payload["integratedTime"].(float64)
 	if !ok {
 		return nil, fmt.Errorf("error getting integratedTime")
 	}
@@ -355,7 +386,7 @@ func getVerificationMaterialTlogEntries(manifestLayer ocispec.Descriptor) ([]*pr
 		return nil, fmt.Errorf("error decoding signedEntryTimestamp: %w", err)
 	}
 	// 3. Unmarshal the body and extract the rekor KindVersion details
-	body, ok := jsonData["Payload"].(map[string]interface{})["body"].(string)
+	body, ok := payload["body"].(string)
 	if !ok {
 		return nil, fmt.Errorf("error getting body")
 	}
@@ -367,8 +398,25 @@ func getVerificationMaterialTlogEntries(manifestLayer ocispec.Descriptor) ([]*pr
 	if err != nil {
 		return nil, fmt.Errorf("error unmarshaling json: %w", err)
 	}
-	apiVersion := jsonData["apiVersion"].(string)
-	kind := jsonData["kind"].(string)
+	if jsonData == nil {
+		return nil, fmt.Errorf("unmarshaled body json data is nil")
+	}
+	apiVersionRaw, ok := jsonData["apiVersion"]
+	if !ok || apiVersionRaw == nil {
+		return nil, fmt.Errorf("error getting apiVersion")
+	}
+	apiVersion, ok := apiVersionRaw.(string)
+	if !ok {
+		return nil, fmt.Errorf("apiVersion is not a string")
+	}
+	kindRaw, ok := jsonData["kind"]
+	if !ok || kindRaw == nil {
+		return nil, fmt.Errorf("error getting kind")
+	}
+	kind, ok := kindRaw.(string)
+	if !ok {
+		return nil, fmt.Errorf("kind is not a string")
+	}
 	// 4. Construct the transparency log entry list
 	return []*protorekor.TransparencyLogEntry{
 		{
@@ -394,11 +442,11 @@ func getVerificationMaterialTlogEntries(manifestLayer ocispec.Descriptor) ([]*pr
 func getBundleMsgSignature(simpleSigningLayer ocispec.Descriptor) (*protobundle.Bundle_MessageSignature, error) {
 	// 1. Get the message digest algorithm
 	var msgHashAlg protocommon.HashAlgorithm
-	switch simpleSigningLayer.Digest.Algorithm() {
+	switch alg := simpleSigningLayer.Digest.Algorithm(); alg {
 	case "sha256":
 		msgHashAlg = protocommon.HashAlgorithm_SHA2_256
 	default:
-		return nil, fmt.Errorf("unknown digest algorithm: %s", simpleSigningLayer.Digest.Algorithm())
+		return nil, fmt.Errorf("unknown digest algorithm: %s", alg)
 	}
 	// 2. Get the message digest
 	digest, err := hex.DecodeString(simpleSigningLayer.Digest.Encoded())
@@ -406,7 +454,7 @@ func getBundleMsgSignature(simpleSigningLayer ocispec.Descriptor) (*protobundle.
 		return nil, fmt.Errorf("error decoding digest: %w", err)
 	}
 	// 3. Get the signature
-	s := simpleSigningLayer.Annotations["dev.cosignproject.cosign/signature"]
+	s := simpleSigningLayer.Annotations[annotationKeySignature]
 	sig, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
 		return nil, fmt.Errorf("error decoding manSig: %w", err)
@@ -423,21 +471,9 @@ func getBundleMsgSignature(simpleSigningLayer ocispec.Descriptor) (*protobundle.
 	}, nil
 }
 
-// performVerification performs the actual signature verification.
-func (v *Verifier) performVerification(bundleObj *bundle.Bundle, layer digest.Digest) (*verify.VerificationResult, error) {
-	digestBytes, err := hex.DecodeString(layer.Encoded())
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode digest hex: %w", err)
-	}
-
-	// Create artifact policy
-	artifactPolicy := verify.WithArtifactDigest(string(layer.Algorithm()), digestBytes)
-	return v.verifier.Verify(bundleObj, verify.NewPolicy(artifactPolicy, v.identityPolicies...))
-}
-
 // getSignatureDescriptors extracts the signature descriptors from the signature
 // manifest.
-func (v *Verifier) getSignatureDescriptors(ctx context.Context, store ratify.Store, repo string, artifactDesc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+func getSignatureDescriptors(ctx context.Context, store ratify.Store, repo string, artifactDesc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 	manifestBytes, err := store.FetchManifest(ctx, repo, artifactDesc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch manifest for artifact: %w", err)
@@ -453,7 +489,7 @@ func (v *Verifier) getSignatureDescriptors(ctx context.Context, store ratify.Sto
 
 	var descriptors []ocispec.Descriptor
 	for _, layer := range manifest.Layers {
-		if layer.MediaType == "application/vnd.dev.cosign.simplesigning.v1+json" {
+		if layer.MediaType == mediaTypeSimpleSigning {
 			descriptors = append(descriptors, layer)
 		}
 	}
@@ -461,7 +497,8 @@ func (v *Verifier) getSignatureDescriptors(ctx context.Context, store ratify.Sto
 	return descriptors, nil
 }
 
-// createTrustedPublicKeyMaterial creates a trusted material from a public key with validity period.
+// createTrustedPublicKeyMaterial creates a trusted material from a public key
+// with validity period.
 func createTrustedPublicKeyMaterial(config *PublicKeyConfig) root.TrustedMaterial {
 	return root.NewTrustedPublicKeyMaterial(func(string) (root.TimeConstrainedVerifier, error) {
 		verifier, err := signature.LoadVerifier(config.PublicKey, config.SignatureAlgorithm)
@@ -469,5 +506,38 @@ func createTrustedPublicKeyMaterial(config *PublicKeyConfig) root.TrustedMateria
 			return nil, err
 		}
 		return root.NewExpiringKey(verifier, config.ValidityPeriodStart, config.ValidityPeriodEnd), nil
+	})
+}
+
+// layerReport is a report generated for a single simple signing
+// layer.
+type layerReport struct {
+	// Digest is the digest of the simple signing layer.
+	Digest string `json:"digest"`
+
+	// Succeeded indicates whether the signature verification succeeded.
+	Succeeded bool `json:"succeeded"`
+
+	// Error contains the error if the verification failed.
+	Error error
+
+	// VerificationResult contains the verification result if the verification
+	// succeeded.
+	VerificationResult *verify.VerificationResult `json:"verificationResult,omitempty"`
+}
+
+// MarshalJSON deals with the Error field to ensure it is serialized correctly.
+func (b *layerReport) MarshalJSON() ([]byte, error) {
+	type Alias layerReport
+	var errorStr string
+	if b.Error != nil {
+		errorStr = b.Error.Error()
+	}
+	return json.Marshal(struct {
+		Alias
+		Error string `json:"error,omitempty"`
+	}{
+		Alias: Alias(*b),
+		Error: errorStr,
 	})
 }
