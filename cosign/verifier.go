@@ -40,13 +40,15 @@ import (
 )
 
 const (
-	verifierTypeCosign        = "cosign"
-	signatureArtifactCosign   = "application/vnd.dev.cosign.artifact.sig.v1+json"
-	sigstoreBundleMediaType01 = "application/vnd.dev.sigstore.bundle+json;version=0.1"
-	annotationKeyBundle       = "dev.sigstore.cosign/bundle"
-	AnnotationKeyCert         = "dev.sigstore.cosign/certificate"
-	annotationKeySignature    = "dev.cosignproject.cosign/signature"
-	mediaTypeSimpleSigning    = "application/vnd.dev.cosign.simplesigning.v1+json"
+	verifierTypeCosign = "cosign"
+
+	mediaTypeCosignArtifactSignature = "application/vnd.dev.cosign.artifact.sig.v1+json"
+	mediaTypeSigstoreBundle01        = "application/vnd.dev.sigstore.bundle+json;version=0.1"
+	mediaTypeSimpleSigning           = "application/vnd.dev.cosign.simplesigning.v1+json"
+
+	annotationKeyBundle    = "dev.sigstore.cosign/bundle"
+	annotationKeyCert      = "dev.sigstore.cosign/certificate"
+	annotationKeySignature = "dev.cosignproject.cosign/signature"
 )
 
 // PublicKeyConfig contains the configuration for key-based verification.
@@ -87,9 +89,9 @@ type VerifierOptions struct {
 	// These policies specify which OIDC identities are trusted. Optional.
 	IdentityPolicies []verify.PolicyOption
 
-	// IgnoreTlog when set to true, skips Artifact transparency log verification.
+	// IgnoreTLog when set to true, skips Artifact transparency log verification.
 	// Only applies to keyless verification. Optional, defaults to false.
-	IgnoreTlog bool
+	IgnoreTLog bool
 
 	// IgnoreCTLog when set to true, skips certificate transparency log verification.
 	// Only applies to keyless verification. Optional, defaults to false.
@@ -104,7 +106,7 @@ type VerifierOptions struct {
 type Verifier struct {
 	name             string
 	identityPolicies []verify.PolicyOption
-	ignoreTlog       bool
+	ignoreTLog       bool
 	verifier         *verify.Verifier
 }
 
@@ -152,7 +154,7 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 	var verifierOpts []verify.VerifierOption
 
 	// Configure transparency log verification
-	if !opts.IgnoreTlog {
+	if !opts.IgnoreTLog {
 		verifierOpts = append(verifierOpts, verify.WithTransparencyLog(1))
 	}
 
@@ -173,7 +175,7 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 	return &Verifier{
 		name:             opts.Name,
 		identityPolicies: opts.IdentityPolicies,
-		ignoreTlog:       opts.IgnoreTlog,
+		ignoreTLog:       opts.IgnoreTLog,
 		verifier:         v,
 	}, nil
 }
@@ -190,7 +192,7 @@ func (v *Verifier) Type() string {
 
 // Verifiable returns true if the artifact is a Cosign signature.
 func (v *Verifier) Verifiable(artifact ocispec.Descriptor) bool {
-	return artifact.ArtifactType == signatureArtifactCosign &&
+	return artifact.ArtifactType == mediaTypeCosignArtifactSignature &&
 		artifact.MediaType == ocispec.MediaTypeImageManifest
 }
 
@@ -248,7 +250,7 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 // verifySignatureLayer verifies a single simple signing layer.
 func (v *Verifier) verifySignatureLayer(manifestLayer ocispec.Descriptor) (*verify.VerificationResult, error) {
 	// Build the verification material for the bundle
-	verificationMaterial, err := getBundleVerificationMaterial(manifestLayer, v.ignoreTlog)
+	verificationMaterial, err := getBundleVerificationMaterial(manifestLayer, v.ignoreTLog)
 	if err != nil {
 		return nil, fmt.Errorf("error getting verification material: %v", err)
 	}
@@ -261,7 +263,7 @@ func (v *Verifier) verifySignatureLayer(manifestLayer ocispec.Descriptor) (*veri
 
 	// Construct and verify the bundle
 	pb := protobundle.Bundle{
-		MediaType:            sigstoreBundleMediaType01,
+		MediaType:            mediaTypeSigstoreBundle01,
 		VerificationMaterial: verificationMaterial,
 		Content:              msgSignature,
 	}
@@ -315,7 +317,7 @@ func getBundleVerificationMaterial(manifestLayer ocispec.Descriptor, ignoreTlog 
 // X509 certificate chain from the simple signing layer
 func getVerificationMaterialX509CertificateChain(manifestLayer ocispec.Descriptor) (*protobundle.VerificationMaterial_X509CertificateChain, error) {
 	// 1. Get the PEM certificate from the simple signing layer
-	pemCert := manifestLayer.Annotations[AnnotationKeyCert]
+	pemCert := manifestLayer.Annotations[annotationKeyCert]
 	// 2. Construct the DER encoded version of the PEM certificate
 	block, _ := pem.Decode([]byte(pemCert))
 	if block == nil {
@@ -332,118 +334,124 @@ func getVerificationMaterialX509CertificateChain(manifestLayer ocispec.Descripto
 	}, nil
 }
 
-// getVerificationMaterialTlogEntries returns the verification material transparency log entries from the simple signing layer
-func getVerificationMaterialTlogEntries(manifestLayer ocispec.Descriptor) ([]*protorekor.TransparencyLogEntry, error) {
-	// 1. Get the bundle annotation
-	if manifestLayer.Annotations == nil {
-		return nil, fmt.Errorf("manifest layer annotations are nil")
+// bundleAnnotation represents the structure of the bundle annotation
+type bundleAnnotation struct {
+	Payload              *bundlePayload `json:"Payload"`
+	SignedEntryTimestamp *string        `json:"SignedEntryTimestamp"`
+}
+
+// bundlePayload represents the payload structure within the bundle
+type bundlePayload struct {
+	LogIndex       *float64 `json:"logIndex"`
+	LogID          *string  `json:"logID"`
+	IntegratedTime *float64 `json:"integratedTime"`
+	Body           *string  `json:"body"`
+}
+
+// payloadBody represents the structure of the decoded body
+type payloadBody struct {
+	APIVersion *string `json:"apiVersion"`
+	Kind       *string `json:"kind"`
+}
+
+func (b *bundleAnnotation) validate() error {
+	if b.Payload == nil {
+		return fmt.Errorf("bundle payload is missing")
 	}
-	bun, exists := manifestLayer.Annotations[annotationKeyBundle]
+	if b.Payload.LogIndex == nil {
+		return fmt.Errorf("bundle payload logIndex is missing")
+	}
+	if b.Payload.LogID == nil {
+		return fmt.Errorf("bundle payload logID is missing")
+	}
+	if b.Payload.IntegratedTime == nil {
+		return fmt.Errorf("bundle payload integratedTime is missing")
+	}
+	if b.Payload.Body == nil {
+		return fmt.Errorf("bundle payload body is missing")
+	}
+	if b.SignedEntryTimestamp == nil {
+		return fmt.Errorf("signed entry timestamp is missing")
+	}
+	return nil
+}
+
+func (b *payloadBody) validate() error {
+	if b.APIVersion == nil {
+		return fmt.Errorf("body apiVersion is missing")
+	}
+	if b.Kind == nil {
+		return fmt.Errorf("body kind is missing")
+	}
+	return nil
+}
+
+// getVerificationMaterialTlogEntries returns the verification material
+// transparency log entries from the simple signing layer
+func getVerificationMaterialTlogEntries(manifestLayer ocispec.Descriptor) ([]*protorekor.TransparencyLogEntry, error) {
+	// 1. Get the bundle annotation from the manifest layer.
+	annotation, exists := manifestLayer.Annotations[annotationKeyBundle]
 	if !exists {
 		return nil, fmt.Errorf("bundle annotation not found")
 	}
-	if bun == "" {
-		return nil, fmt.Errorf("bundle annotation is empty")
-	}
 
-	var jsonData map[string]any
-	err := json.Unmarshal([]byte(bun), &jsonData)
-	if err != nil {
-		return nil, fmt.Errorf("error unmarshaling json: %w", err)
+	// 2. Unmarshal the bundle annotation into a bundleAnnotation.
+	var bundle bundleAnnotation
+	if err := json.Unmarshal([]byte(annotation), &bundle); err != nil {
+		return nil, fmt.Errorf("error unmarshaling bundle annotation: %w", err)
 	}
-	if jsonData == nil {
-		return nil, fmt.Errorf("unmarshaled json data is nil")
+	if err := bundle.validate(); err != nil {
+		return nil, fmt.Errorf("bundle validation failed: %w", err)
 	}
-
-	// 2. Get the log index, log ID, integrated time, signed entry timestamp and body
-	payload, ok := jsonData["Payload"].(map[string]any)
-	if !ok || payload == nil {
-		return nil, fmt.Errorf("error getting Payload")
-	}
-
-	logIndex, ok := payload["logIndex"].(float64)
-	if !ok {
-		return nil, fmt.Errorf("error getting logIndex")
-	}
-	li, ok := payload["logID"].(string)
-	if !ok {
-		return nil, fmt.Errorf("error getting logID")
-	}
-	logID, err := hex.DecodeString(li)
+	logID, err := hex.DecodeString(*bundle.Payload.LogID)
 	if err != nil {
 		return nil, fmt.Errorf("error decoding logID: %w", err)
 	}
-	integratedTime, ok := payload["integratedTime"].(float64)
-	if !ok {
-		return nil, fmt.Errorf("error getting integratedTime")
-	}
-	set, ok := jsonData["SignedEntryTimestamp"].(string)
-	if !ok {
-		return nil, fmt.Errorf("error getting SignedEntryTimestamp")
-	}
-	signedEntryTimestamp, err := base64.StdEncoding.DecodeString(set)
+	signedEntryTimestamp, err := base64.StdEncoding.DecodeString(*bundle.SignedEntryTimestamp)
 	if err != nil {
 		return nil, fmt.Errorf("error decoding signedEntryTimestamp: %w", err)
 	}
-	// 3. Unmarshal the body and extract the rekor KindVersion details
-	body, ok := payload["body"].(string)
-	if !ok {
-		return nil, fmt.Errorf("error getting body")
-	}
-	bodyBytes, err := base64.StdEncoding.DecodeString(body)
+
+	// 3. Decode the body from the bundle payload.
+	bodyDecoded, err := base64.StdEncoding.DecodeString(*bundle.Payload.Body)
 	if err != nil {
-		return nil, fmt.Errorf("error decoding body: %w", err)
+		return nil, err
 	}
-	err = json.Unmarshal(bodyBytes, &jsonData)
-	if err != nil {
-		return nil, fmt.Errorf("error unmarshaling json: %w", err)
+	var body payloadBody
+	if err := json.Unmarshal(bodyDecoded, &body); err != nil {
+		return nil, fmt.Errorf("error unmarshaling body: %w", err)
 	}
-	if jsonData == nil {
-		return nil, fmt.Errorf("unmarshaled body json data is nil")
+	if err := body.validate(); err != nil {
+		return nil, fmt.Errorf("body validation failed: %w", err)
 	}
-	apiVersionRaw, ok := jsonData["apiVersion"]
-	if !ok || apiVersionRaw == nil {
-		return nil, fmt.Errorf("error getting apiVersion")
-	}
-	apiVersion, ok := apiVersionRaw.(string)
-	if !ok {
-		return nil, fmt.Errorf("apiVersion is not a string")
-	}
-	kindRaw, ok := jsonData["kind"]
-	if !ok || kindRaw == nil {
-		return nil, fmt.Errorf("error getting kind")
-	}
-	kind, ok := kindRaw.(string)
-	if !ok {
-		return nil, fmt.Errorf("kind is not a string")
-	}
-	// 4. Construct the transparency log entry list
+
+	// 4. Construct the transparency log entry.
 	return []*protorekor.TransparencyLogEntry{
 		{
-			LogIndex: int64(logIndex),
+			LogIndex: int64(*bundle.Payload.LogIndex),
 			LogId: &protocommon.LogId{
 				KeyId: logID,
 			},
 			KindVersion: &protorekor.KindVersion{
-				Kind:    kind,
-				Version: apiVersion,
+				Kind:    *body.Kind,
+				Version: *body.APIVersion,
 			},
-			IntegratedTime: int64(integratedTime),
+			IntegratedTime: int64(*bundle.Payload.IntegratedTime),
 			InclusionPromise: &protorekor.InclusionPromise{
 				SignedEntryTimestamp: signedEntryTimestamp,
 			},
-			InclusionProof:    nil,
-			CanonicalizedBody: bodyBytes,
+			CanonicalizedBody: bodyDecoded,
 		},
 	}, nil
 }
 
-// getBundleMsgSignature returns the bundle message signature from the simple signing layer
+// getBundleMsgSignature returns the bundle message signature from the simple
+// signing layer
 func getBundleMsgSignature(simpleSigningLayer ocispec.Descriptor) (*protobundle.Bundle_MessageSignature, error) {
 	// 1. Get the message digest algorithm
 	var msgHashAlg protocommon.HashAlgorithm
 	switch alg := simpleSigningLayer.Digest.Algorithm(); alg {
-	case "sha256":
+	case digest.SHA256:
 		msgHashAlg = protocommon.HashAlgorithm_SHA2_256
 	default:
 		return nil, fmt.Errorf("unknown digest algorithm: %s", alg)

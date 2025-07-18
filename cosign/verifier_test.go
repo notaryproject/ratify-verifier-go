@@ -255,7 +255,7 @@ func TestVerifier_Verifiable(t *testing.T) {
 		{
 			name: "valid cosign signature artifact",
 			descriptor: ocispec.Descriptor{
-				ArtifactType: signatureArtifactCosign,
+				ArtifactType: mediaTypeCosignArtifactSignature,
 				MediaType:    ocispec.MediaTypeImageManifest,
 			},
 			expected: true,
@@ -271,7 +271,7 @@ func TestVerifier_Verifiable(t *testing.T) {
 		{
 			name: "invalid media type",
 			descriptor: ocispec.Descriptor{
-				ArtifactType: signatureArtifactCosign,
+				ArtifactType: mediaTypeCosignArtifactSignature,
 				MediaType:    "invalid-media-type",
 			},
 			expected: false,
@@ -309,7 +309,7 @@ func TestGetVerificationMaterialX509CertificateChain(t *testing.T) {
 			name: "valid certificate",
 			layer: ocispec.Descriptor{
 				Annotations: map[string]string{
-					AnnotationKeyCert: certPEM,
+					annotationKeyCert: certPEM,
 				},
 			},
 			expectError: false,
@@ -325,7 +325,7 @@ func TestGetVerificationMaterialX509CertificateChain(t *testing.T) {
 			name: "invalid PEM",
 			layer: ocispec.Descriptor{
 				Annotations: map[string]string{
-					AnnotationKeyCert: "invalid-pem",
+					annotationKeyCert: "invalid-pem",
 				},
 			},
 			expectError: true,
@@ -647,7 +647,7 @@ func TestVerifier_VerifyIntegration(t *testing.T) {
 	// Create a verifier with minimal setup
 	opts := &VerifierOptions{
 		Name:       "test-verifier",
-		IgnoreTlog: true, // Ignore tlog for this test
+		IgnoreTLog: true, // Ignore tlog for this test
 	}
 
 	verifier, err := NewVerifier(opts)
@@ -657,7 +657,7 @@ func TestVerifier_VerifyIntegration(t *testing.T) {
 
 	// Create test artifact descriptor
 	artifactDesc := ocispec.Descriptor{
-		ArtifactType: signatureArtifactCosign,
+		ArtifactType: mediaTypeCosignArtifactSignature,
 		MediaType:    ocispec.MediaTypeImageManifest,
 		Digest:       digest.FromString("test-artifact"),
 		Size:         100,
@@ -715,7 +715,7 @@ func TestGetBundleVerificationMaterial(t *testing.T) {
 
 	layer := ocispec.Descriptor{
 		Annotations: map[string]string{
-			AnnotationKeyCert:   certPEM,
+			annotationKeyCert:   certPEM,
 			annotationKeyBundle: bundleAnnotation,
 		},
 	}
@@ -778,7 +778,7 @@ func TestVerifier_VerifyWithSignatureLayers(t *testing.T) {
 	// Create a verifier
 	opts := &VerifierOptions{
 		Name:       "test-verifier",
-		IgnoreTlog: true, // Ignore tlog for this test
+		IgnoreTLog: true, // Ignore tlog for this test
 	}
 
 	verifier, err := NewVerifier(opts)
@@ -805,7 +805,7 @@ func TestVerifier_VerifyWithSignatureLayers(t *testing.T) {
 		Digest:    digest.FromString("signature-layer"),
 		Size:      100,
 		Annotations: map[string]string{
-			AnnotationKeyCert:      certPEM,
+			annotationKeyCert:      certPEM,
 			annotationKeySignature: testSignature,
 		},
 	}
@@ -817,7 +817,7 @@ func TestVerifier_VerifyWithSignatureLayers(t *testing.T) {
 	}
 
 	artifactDesc := ocispec.Descriptor{
-		ArtifactType: signatureArtifactCosign,
+		ArtifactType: mediaTypeCosignArtifactSignature,
 		MediaType:    ocispec.MediaTypeImageManifest,
 		Digest:       digest.FromBytes(manifestBytes),
 		Size:         int64(len(manifestBytes)),
@@ -936,7 +936,7 @@ func TestVerifier_VerifyBundleError(t *testing.T) {
 	// Test verifyBundle method with invalid digest
 	verifier := &Verifier{
 		name:       "test-verifier",
-		ignoreTlog: true,
+		ignoreTLog: true,
 	}
 
 	// Create an invalid digest that should cause hex decoding to fail
@@ -1128,7 +1128,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "unmarshaled json data is nil",
+			errorMsg:    "bundle payload is missing",
 		},
 		// Test case: Payload exists but is null
 		{
@@ -1139,7 +1139,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting Payload",
+			errorMsg:    "bundle payload is missing",
 		},
 		// Test case: logIndex is not float64 (wrong type)
 		{
@@ -1155,7 +1155,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting logIndex",
+			errorMsg:    "error unmarshaling bundle annotation",
 		},
 		// Test case: logID is not string (wrong type)
 		{
@@ -1171,7 +1171,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting logID",
+			errorMsg:    "error unmarshaling bundle annotation",
 		},
 		// Test case: invalid hex in logID
 		{
@@ -1203,7 +1203,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting integratedTime",
+			errorMsg:    "bundle payload integratedTime is missing",
 		},
 		// Test case: integratedTime is not float64 (wrong type)
 		{
@@ -1219,7 +1219,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting integratedTime",
+			errorMsg:    "error unmarshaling bundle annotation",
 		},
 		// Test case: missing SignedEntryTimestamp
 		{
@@ -1237,7 +1237,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting SignedEntryTimestamp",
+			errorMsg:    "signed entry timestamp is missing",
 		},
 		// Test case: SignedEntryTimestamp is not string (wrong type)
 		{
@@ -1248,7 +1248,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting SignedEntryTimestamp",
+			errorMsg:    "error unmarshaling bundle annotation",
 		},
 		// Test case: invalid base64 in SignedEntryTimestamp
 		{
@@ -1275,7 +1275,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting body",
+			errorMsg:    "bundle payload body is missing",
 		},
 		// Test case: body is not string (wrong type)
 		{
@@ -1291,7 +1291,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting body",
+			errorMsg:    "error unmarshaling bundle annotation",
 		},
 		// Test case: invalid JSON in body after base64 decode
 		{
@@ -1307,7 +1307,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error unmarshaling json",
+			errorMsg:    "error unmarshaling body",
 		},
 		// Test case: body contains null JSON (edge case)
 		{
@@ -1323,7 +1323,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "unmarshaled body json data is nil",
+			errorMsg:    "body apiVersion is missing",
 		},
 		// Test case: missing apiVersion
 		{
@@ -1339,7 +1339,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting apiVersion",
+			errorMsg:    "body apiVersion is missing",
 		},
 		// Test case: apiVersion is null
 		{
@@ -1355,7 +1355,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting apiVersion",
+			errorMsg:    "body apiVersion is missing",
 		},
 		// Test case: apiVersion is not string (wrong type)
 		{
@@ -1371,7 +1371,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "apiVersion is not a string",
+			errorMsg:    "error unmarshaling body",
 		},
 		// Test case: missing kind
 		{
@@ -1387,7 +1387,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting kind",
+			errorMsg:    "body kind is missing",
 		},
 		// Test case: kind is null
 		{
@@ -1403,7 +1403,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "error getting kind",
+			errorMsg:    "body kind is missing",
 		},
 		// Test case: kind is not string (wrong type)
 		{
@@ -1419,7 +1419,7 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				},
 			},
 			expectError: true,
-			errorMsg:    "kind is not a string",
+			errorMsg:    "error unmarshaling body",
 		},
 		// Test case: success with all valid fields
 		{

@@ -1,4 +1,4 @@
-module github.com/binbin-li/ratify-verifier-go/cosign
+module github.com/notaryproject/ratify-verifier-go/cosign
 
 go 1.24.0
 
