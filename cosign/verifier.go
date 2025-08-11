@@ -81,9 +81,11 @@ type VerifierOptions struct {
 	// If not provided, the default Sigstore trusted root will be used.
 	TrustedRoot *root.TrustedRoot
 
-	// PublicKeyConfig contains the public key and its validity period for key-based verification.
-	// If provided, key-based verification will be performed. Optional.
-	PublicKeyConfigs []*PublicKeyConfig
+	// PublicKeys contains the public keys for key-based verification.
+	// If provided, key-based verification will be performed. Otherwise, keyless
+	// verification will be used.
+	// Optional.
+	PublicKeys TrustedPublicKeys
 
 	// IdentityPolicies contains policies for keyless verification.
 	// These policies specify which OIDC identities are trusted. Optional.
@@ -107,28 +109,61 @@ type Verifier struct {
 	name             string
 	identityPolicies []verify.PolicyOption
 	ignoreTLog       bool
-	verifier         *verify.Verifier
+	publicKeys       TrustedPublicKeys
+	getVerifier      func() (*verify.Verifier, error)
+}
+
+// TrustedPublicKeys defines an interface for fetching trusted public keys.
+// It's used during every verification process. The implementation should handle
+// the retrieval and management of public keys.
+type TrustedPublicKeys interface {
+	// GetPublicKeys returns the public keys for key-based verification.
+	GetPublicKeys(ctx context.Context) ([]*PublicKeyConfig, error)
 }
 
 // NewVerifier creates a new Cosign verifier.
 func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
+	if opts == nil {
+		return nil, fmt.Errorf("verifier options are required")
+	}
 	if opts.Name == "" {
 		return nil, fmt.Errorf("verifier name is required")
 	}
 
-	trustedMaterial := make(root.TrustedMaterialCollection, 0)
-
-	// Key-based verification: create trusted material with the public keys
-	for _, config := range opts.PublicKeyConfigs {
-		if config == nil {
-			return nil, fmt.Errorf("public key config cannot be nil")
-		}
-		if config.SignatureAlgorithm == 0 {
-			// Default to SHA256 if no algorithm is specified
-			config.SignatureAlgorithm = crypto.SHA256
-		}
-		trustedMaterial = append(trustedMaterial, createTrustedPublicKeyMaterial(config))
+	v, err := createVerifier(opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create verifier: %w", err)
 	}
+
+	var getVerifier func() (*verify.Verifier, error)
+	if opts.PublicKeys != nil {
+		getVerifier = func() (*verify.Verifier, error) {
+			return createVerifier(opts)
+		}
+	} else {
+		getVerifier = func() (*verify.Verifier, error) {
+			return v, nil
+		}
+	}
+
+	return &Verifier{
+		getVerifier:      getVerifier,
+		name:             opts.Name,
+		identityPolicies: opts.IdentityPolicies,
+		ignoreTLog:       opts.IgnoreTLog,
+		publicKeys:       opts.PublicKeys,
+	}, nil
+}
+
+func createVerifier(opts *VerifierOptions) (*verify.Verifier, error) {
+	var trustedMaterial root.TrustedMaterialCollection
+
+	// Create trusted material from public keys if provided.
+	trustedPublicKeyMaterial, err := createTrustedMaterialFromPublicKeys(context.Background(), opts.PublicKeys)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create trusted material from public keys: %w", err)
+	}
+	trustedMaterial = append(trustedMaterial, trustedPublicKeyMaterial...)
 
 	// Keyless verification: use provided trusted root or fetch from TUF
 	if opts.TrustedRoot != nil {
@@ -167,17 +202,31 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 	}
 
 	// Create the underlying cosign verifier
-	v, err := verify.NewVerifier(trustedMaterial, verifierOpts...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create verifier: %w", err)
+	return verify.NewVerifier(trustedMaterial, verifierOpts...)
+}
+
+func createTrustedMaterialFromPublicKeys(ctx context.Context, trustedPublicKeys TrustedPublicKeys) ([]root.TrustedMaterial, error) {
+	var trustedMaterial []root.TrustedMaterial
+	if trustedPublicKeys == nil {
+		return trustedMaterial, nil
 	}
 
-	return &Verifier{
-		name:             opts.Name,
-		identityPolicies: opts.IdentityPolicies,
-		ignoreTLog:       opts.IgnoreTLog,
-		verifier:         v,
-	}, nil
+	publicKeys, err := trustedPublicKeys.GetPublicKeys(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get public keys: %w", err)
+	}
+
+	for _, config := range publicKeys {
+		if config == nil {
+			return nil, fmt.Errorf("public key config cannot be nil")
+		}
+		if config.SignatureAlgorithm == 0 {
+			// Default to SHA256 if no algorithm is specified
+			config.SignatureAlgorithm = crypto.SHA256
+		}
+		trustedMaterial = append(trustedMaterial, createTrustedPublicKeyMaterial(config))
+	}
+	return trustedMaterial, nil
 }
 
 // Name returns the name of the verifier.
@@ -250,7 +299,7 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 // verifySignatureLayer verifies a single simple signing layer.
 func (v *Verifier) verifySignatureLayer(manifestLayer ocispec.Descriptor) (*verify.VerificationResult, error) {
 	// Build the verification material for the bundle
-	verificationMaterial, err := getBundleVerificationMaterial(manifestLayer, v.ignoreTLog)
+	verificationMaterial, err := getBundleVerificationMaterial(manifestLayer, v.ignoreTLog, v.publicKeys)
 	if err != nil {
 		return nil, fmt.Errorf("error getting verification material: %v", err)
 	}
@@ -284,20 +333,19 @@ func (v *Verifier) verifyBundle(bundleObj *bundle.Bundle, layer digest.Digest) (
 
 	// Create artifact policy
 	artifactPolicy := verify.WithArtifactDigest(string(layer.Algorithm()), digestBytes)
-	return v.verifier.Verify(bundleObj, verify.NewPolicy(artifactPolicy, v.identityPolicies...))
+	verifier, err := v.getVerifier()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get verifier: %w", err)
+	}
+	return verifier.Verify(bundleObj, verify.NewPolicy(artifactPolicy, v.identityPolicies...))
 }
 
 // getBundleVerificationMaterial returns the bundle verification material from
 // the simple signing layer
-func getBundleVerificationMaterial(manifestLayer ocispec.Descriptor, ignoreTlog bool) (*protobundle.VerificationMaterial, error) {
-	// 1. Get the signing certificate chain
-	signingCert, err := getVerificationMaterialX509CertificateChain(manifestLayer)
-	if err != nil {
-		return nil, fmt.Errorf("error getting signing certificate: %w", err)
-	}
-
-	// 2. Get the transparency log entries
+func getBundleVerificationMaterial(manifestLayer ocispec.Descriptor, ignoreTlog bool, publicKeys TrustedPublicKeys) (*protobundle.VerificationMaterial, error) {
+	// 1. Get the transparency log entries
 	var tlogEntries []*protorekor.TransparencyLogEntry
+	var err error
 	if !ignoreTlog {
 		tlogEntries, err = getVerificationMaterialTlogEntries(manifestLayer)
 		if err != nil {
@@ -305,12 +353,28 @@ func getBundleVerificationMaterial(manifestLayer ocispec.Descriptor, ignoreTlog 
 		}
 	}
 
-	// 3. Construct the verification material
-	return &protobundle.VerificationMaterial{
-		Content:                   signingCert,
+	// 2. Construct the verification material based on the type of verification
+	verificationMaterial := &protobundle.VerificationMaterial{
 		TlogEntries:               tlogEntries,
 		TimestampVerificationData: nil, // TODO: support RFC3161Timestamp.
-	}, nil
+	}
+	if publicKeys != nil {
+		// If we have public keys, construct an empty public key material
+		verificationMaterial.Content = &protobundle.VerificationMaterial_PublicKey{
+			PublicKey: &protocommon.PublicKeyIdentifier{
+				Hint: "",
+			},
+		}
+	} else {
+		// Otherwise, get the signing certificate chain from the manifest
+		signingCert, err := getVerificationMaterialX509CertificateChain(manifestLayer)
+		if err != nil {
+			return nil, fmt.Errorf("error getting signing certificate: %w", err)
+		}
+		verificationMaterial.Content = signingCert
+	}
+
+	return verificationMaterial, nil
 }
 
 // getVerificationMaterialX509CertificateChain returns the verification material
