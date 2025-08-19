@@ -192,14 +192,14 @@ func TestNewVerifier(t *testing.T) {
 			name: "with public key config",
 			opts: &VerifierOptions{
 				Name: "test-verifier",
-				PublicKeys: &testTrustedPublicKeys{
+				GetPublicKeys: (&testTrustedPublicKeys{
 					configs: []*PublicKeyConfig{
 						{
 							PublicKey:          &ecdsa.PublicKey{},
 							SignatureAlgorithm: crypto.SHA256,
 						},
 					},
-				},
+				}).GetPublicKeys,
 			},
 			expectError: false,
 		},
@@ -207,13 +207,13 @@ func TestNewVerifier(t *testing.T) {
 			name: "with nil public key config",
 			opts: &VerifierOptions{
 				Name: "test-verifier",
-				PublicKeys: &testTrustedPublicKeys{
+				GetPublicKeys: (&testTrustedPublicKeys{
 					configs: []*PublicKeyConfig{
 						nil,
 					},
-				},
+				}).GetPublicKeys,
 			},
-			expectError: true,
+			expectError: false, // NewVerifier doesn't validate immediately, validation happens on use
 		},
 		{
 			name: "with identity policies",
@@ -661,24 +661,24 @@ func TestCreateTrustedPublicKeyMaterial(t *testing.T) {
 func TestCreateTrustedMaterialFromPublicKeys(t *testing.T) {
 	tests := []struct {
 		name                string
-		trustedPublicKeys   TrustedPublicKeys
+		getPublicKeys       func(ctx context.Context) ([]*PublicKeyConfig, error)
 		expectedMaterialLen int
 		expectError         bool
 	}{
 		{
 			name:                "nil trusted public keys",
-			trustedPublicKeys:   nil,
+			getPublicKeys:       nil,
 			expectedMaterialLen: 0,
 			expectError:         false,
 		},
 		{
 			name: "single valid public key",
-			trustedPublicKeys: func() TrustedPublicKeys {
+			getPublicKeys: func() func(ctx context.Context) ([]*PublicKeyConfig, error) {
 				_, publicKey, err := generateTestKey()
 				if err != nil {
 					t.Fatalf("Failed to generate test key: %v", err)
 				}
-				return &testTrustedPublicKeys{
+				return (&testTrustedPublicKeys{
 					configs: []*PublicKeyConfig{
 						{
 							PublicKey:           publicKey,
@@ -687,14 +687,14 @@ func TestCreateTrustedMaterialFromPublicKeys(t *testing.T) {
 							ValidityPeriodEnd:   time.Now().Add(time.Hour),
 						},
 					},
-				}
+				}).GetPublicKeys
 			}(),
 			expectedMaterialLen: 1,
 			expectError:         false,
 		},
 		{
 			name: "multiple valid public keys",
-			trustedPublicKeys: func() TrustedPublicKeys {
+			getPublicKeys: func() func(ctx context.Context) ([]*PublicKeyConfig, error) {
 				_, publicKey1, err := generateTestKey()
 				if err != nil {
 					t.Fatalf("Failed to generate test key 1: %v", err)
@@ -703,7 +703,7 @@ func TestCreateTrustedMaterialFromPublicKeys(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Failed to generate test key 2: %v", err)
 				}
-				return &testTrustedPublicKeys{
+				return (&testTrustedPublicKeys{
 					configs: []*PublicKeyConfig{
 						{
 							PublicKey:           publicKey1,
@@ -718,19 +718,19 @@ func TestCreateTrustedMaterialFromPublicKeys(t *testing.T) {
 							ValidityPeriodEnd:   time.Now().Add(2 * time.Hour),
 						},
 					},
-				}
+				}).GetPublicKeys
 			}(),
 			expectedMaterialLen: 2,
 			expectError:         false,
 		},
 		{
 			name: "public key with zero algorithm (defaults to SHA256)",
-			trustedPublicKeys: func() TrustedPublicKeys {
+			getPublicKeys: func() func(ctx context.Context) ([]*PublicKeyConfig, error) {
 				_, publicKey, err := generateTestKey()
 				if err != nil {
 					t.Fatalf("Failed to generate test key: %v", err)
 				}
-				return &testTrustedPublicKeys{
+				return (&testTrustedPublicKeys{
 					configs: []*PublicKeyConfig{
 						{
 							PublicKey:           publicKey,
@@ -739,24 +739,24 @@ func TestCreateTrustedMaterialFromPublicKeys(t *testing.T) {
 							ValidityPeriodEnd:   time.Now().Add(time.Hour),
 						},
 					},
-				}
+				}).GetPublicKeys
 			}(),
 			expectedMaterialLen: 1,
 			expectError:         false,
 		},
 		{
 			name: "nil public key config",
-			trustedPublicKeys: &testTrustedPublicKeys{
+			getPublicKeys: (&testTrustedPublicKeys{
 				configs: []*PublicKeyConfig{nil},
-			},
+			}).GetPublicKeys,
 			expectedMaterialLen: 0,
 			expectError:         true,
 		},
 		{
 			name: "error getting public keys",
-			trustedPublicKeys: &testTrustedPublicKeys{
+			getPublicKeys: (&testTrustedPublicKeys{
 				err: fmt.Errorf("failed to get public keys"),
-			},
+			}).GetPublicKeys,
 			expectedMaterialLen: 0,
 			expectError:         true,
 		},
@@ -764,7 +764,7 @@ func TestCreateTrustedMaterialFromPublicKeys(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			materials, err := createTrustedMaterialFromPublicKeys(context.Background(), tt.trustedPublicKeys)
+			materials, err := createTrustedMaterialFromPublicKeys(context.Background(), tt.getPublicKeys)
 
 			if tt.expectError {
 				if err == nil {
@@ -852,14 +852,14 @@ func TestPublicKeyConfigDefaults(t *testing.T) {
 
 	opts := &VerifierOptions{
 		Name: "test-verifier",
-		PublicKeys: &testTrustedPublicKeys{
+		GetPublicKeys: (&testTrustedPublicKeys{
 			configs: []*PublicKeyConfig{
 				{
 					PublicKey: publicKey,
 					// SignatureAlgorithm not set - should default to SHA256
 				},
 			},
-		},
+		}).GetPublicKeys,
 	}
 
 	verifier, err := NewVerifier(opts)
@@ -1210,7 +1210,7 @@ func TestVerifierOptions_Validation(t *testing.T) {
 			name: "with multiple public key configs",
 			opts: &VerifierOptions{
 				Name: "test-verifier",
-				PublicKeys: &testTrustedPublicKeys{
+				GetPublicKeys: (&testTrustedPublicKeys{
 					configs: []*PublicKeyConfig{
 						{
 							PublicKey:          &ecdsa.PublicKey{},
@@ -1221,7 +1221,7 @@ func TestVerifierOptions_Validation(t *testing.T) {
 							SignatureAlgorithm: crypto.SHA512,
 						},
 					},
-				},
+				}).GetPublicKeys,
 			},
 			expectError: false,
 		},
@@ -1815,14 +1815,14 @@ func TestNewVerifier_GetVerifierPaths(t *testing.T) {
 			name: "with public keys (keyed verification path)",
 			opts: &VerifierOptions{
 				Name: "test-verifier",
-				PublicKeys: &testTrustedPublicKeys{
+				GetPublicKeys: (&testTrustedPublicKeys{
 					configs: []*PublicKeyConfig{
 						{
 							PublicKey:          publicKey,
 							SignatureAlgorithm: crypto.SHA256,
 						},
 					},
-				},
+				}).GetPublicKeys,
 			},
 			expectError: false,
 		},
@@ -1985,12 +1985,12 @@ func TestVerifier_VerifyMalformedManifests(t *testing.T) {
 // Test getBundleVerificationMaterial error cases to improve coverage
 func TestGetBundleVerificationMaterial_ErrorCases(t *testing.T) {
 	tests := []struct {
-		name        string
-		layer       ocispec.Descriptor
-		ignoreTlog  bool
-		publicKeys  TrustedPublicKeys
-		expectError bool
-		errorMsg    string
+		name          string
+		layer         ocispec.Descriptor
+		ignoreTlog    bool
+		getPublicKeys func(ctx context.Context) ([]*PublicKeyConfig, error)
+		expectError   bool
+		errorMsg      string
 	}{
 		{
 			name: "tlog entry error when not ignored",
@@ -1999,10 +1999,10 @@ func TestGetBundleVerificationMaterial_ErrorCases(t *testing.T) {
 					annotationKeyBundle: "invalid-bundle",
 				},
 			},
-			ignoreTlog:  false,
-			publicKeys:  nil,
-			expectError: true,
-			errorMsg:    "error getting tlog entries",
+			ignoreTlog:    false,
+			getPublicKeys: nil,
+			expectError:   true,
+			errorMsg:      "error getting tlog entries",
 		},
 		{
 			name: "certificate error when no public keys",
@@ -2011,16 +2011,16 @@ func TestGetBundleVerificationMaterial_ErrorCases(t *testing.T) {
 					annotationKeyCert: "invalid-cert",
 				},
 			},
-			ignoreTlog:  true, // Skip tlog to hit cert error
-			publicKeys:  nil,  // No public keys, so will try to get cert
-			expectError: true,
-			errorMsg:    "error getting signing certificate",
+			ignoreTlog:    true, // Skip tlog to hit cert error
+			getPublicKeys: nil,  // No public keys, so will try to get cert
+			expectError:   true,
+			errorMsg:      "error getting signing certificate",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := getBundleVerificationMaterial(tt.layer, tt.ignoreTlog, tt.publicKeys)
+			_, err := getBundleVerificationMaterial(tt.layer, tt.ignoreTlog, tt.getPublicKeys)
 			if tt.expectError {
 				if err == nil {
 					t.Errorf("Expected error but got none")

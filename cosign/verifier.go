@@ -81,11 +81,8 @@ type VerifierOptions struct {
 	// If not provided, the default Sigstore trusted root will be used.
 	TrustedRoot *root.TrustedRoot
 
-	// PublicKeys contains the public keys for key-based verification.
-	// If provided, key-based verification will be performed. Otherwise, keyless
-	// verification will be used.
-	// Optional.
-	PublicKeys TrustedPublicKeys
+	// GetPublicKeys retrieves the public keys for key-based verification.
+	GetPublicKeys func(ctx context.Context) ([]*PublicKeyConfig, error)
 
 	// IdentityPolicies contains policies for keyless verification.
 	// These policies specify which OIDC identities are trusted. Optional.
@@ -109,16 +106,8 @@ type Verifier struct {
 	name             string
 	identityPolicies []verify.PolicyOption
 	ignoreTLog       bool
-	publicKeys       TrustedPublicKeys
+	getPublicKeys    func(context.Context) ([]*PublicKeyConfig, error)
 	getVerifier      func() (*verify.Verifier, error)
-}
-
-// TrustedPublicKeys defines an interface for fetching trusted public keys.
-// It's used during every verification process. The implementation should handle
-// the retrieval and management of public keys.
-type TrustedPublicKeys interface {
-	// GetPublicKeys returns the public keys for key-based verification.
-	GetPublicKeys(ctx context.Context) ([]*PublicKeyConfig, error)
 }
 
 // NewVerifier creates a new Cosign verifier.
@@ -130,17 +119,16 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 		return nil, fmt.Errorf("verifier name is required")
 	}
 
-	v, err := createVerifier(opts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create verifier: %w", err)
-	}
-
 	var getVerifier func() (*verify.Verifier, error)
-	if opts.PublicKeys != nil {
+	if opts.GetPublicKeys != nil {
 		getVerifier = func() (*verify.Verifier, error) {
 			return createVerifier(opts)
 		}
 	} else {
+		v, err := createVerifier(opts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create verifier: %w", err)
+		}
 		getVerifier = func() (*verify.Verifier, error) {
 			return v, nil
 		}
@@ -151,7 +139,7 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 		name:             opts.Name,
 		identityPolicies: opts.IdentityPolicies,
 		ignoreTLog:       opts.IgnoreTLog,
-		publicKeys:       opts.PublicKeys,
+		getPublicKeys:    opts.GetPublicKeys,
 	}, nil
 }
 
@@ -159,7 +147,7 @@ func createVerifier(opts *VerifierOptions) (*verify.Verifier, error) {
 	var trustedMaterial root.TrustedMaterialCollection
 
 	// Create trusted material from public keys if provided.
-	trustedPublicKeyMaterial, err := createTrustedMaterialFromPublicKeys(context.Background(), opts.PublicKeys)
+	trustedPublicKeyMaterial, err := createTrustedMaterialFromPublicKeys(context.Background(), opts.GetPublicKeys)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create trusted material from public keys: %w", err)
 	}
@@ -205,13 +193,13 @@ func createVerifier(opts *VerifierOptions) (*verify.Verifier, error) {
 	return verify.NewVerifier(trustedMaterial, verifierOpts...)
 }
 
-func createTrustedMaterialFromPublicKeys(ctx context.Context, trustedPublicKeys TrustedPublicKeys) ([]root.TrustedMaterial, error) {
+func createTrustedMaterialFromPublicKeys(ctx context.Context, getPublicKeys func(context.Context) ([]*PublicKeyConfig, error)) ([]root.TrustedMaterial, error) {
 	var trustedMaterial []root.TrustedMaterial
-	if trustedPublicKeys == nil {
+	if getPublicKeys == nil {
 		return trustedMaterial, nil
 	}
 
-	publicKeys, err := trustedPublicKeys.GetPublicKeys(ctx)
+	publicKeys, err := getPublicKeys(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get public keys: %w", err)
 	}
@@ -299,7 +287,7 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 // verifySignatureLayer verifies a single simple signing layer.
 func (v *Verifier) verifySignatureLayer(manifestLayer ocispec.Descriptor) (*verify.VerificationResult, error) {
 	// Build the verification material for the bundle
-	verificationMaterial, err := getBundleVerificationMaterial(manifestLayer, v.ignoreTLog, v.publicKeys)
+	verificationMaterial, err := getBundleVerificationMaterial(manifestLayer, v.ignoreTLog, v.getPublicKeys)
 	if err != nil {
 		return nil, fmt.Errorf("error getting verification material: %v", err)
 	}
@@ -342,7 +330,7 @@ func (v *Verifier) verifyBundle(bundleObj *bundle.Bundle, layer digest.Digest) (
 
 // getBundleVerificationMaterial returns the bundle verification material from
 // the simple signing layer
-func getBundleVerificationMaterial(manifestLayer ocispec.Descriptor, ignoreTlog bool, publicKeys TrustedPublicKeys) (*protobundle.VerificationMaterial, error) {
+func getBundleVerificationMaterial(manifestLayer ocispec.Descriptor, ignoreTlog bool, getPublicKeys func(ctx context.Context) ([]*PublicKeyConfig, error)) (*protobundle.VerificationMaterial, error) {
 	// 1. Get the transparency log entries
 	var tlogEntries []*protorekor.TransparencyLogEntry
 	var err error
@@ -358,7 +346,9 @@ func getBundleVerificationMaterial(manifestLayer ocispec.Descriptor, ignoreTlog 
 		TlogEntries:               tlogEntries,
 		TimestampVerificationData: nil, // TODO: support RFC3161Timestamp.
 	}
-	if publicKeys != nil {
+	// If getPublicKeys is nil, this indicates keyless verification.
+	// If getPublicKeys is non-nil, this indicates key-based verification.
+	if getPublicKeys != nil {
 		// If we have public keys, construct an empty public key material
 		verificationMaterial.Content = &protobundle.VerificationMaterial_PublicKey{
 			PublicKey: &protocommon.PublicKeyIdentifier{
