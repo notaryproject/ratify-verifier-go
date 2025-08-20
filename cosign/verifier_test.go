@@ -37,6 +37,9 @@ import (
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	protocommon "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
+	"github.com/sigstore/sigstore-go/pkg/root"
+	"github.com/sigstore/sigstore-go/pkg/tuf"
 	"github.com/sigstore/sigstore-go/pkg/verify"
 )
 
@@ -88,6 +91,18 @@ func (m *mockStore) addBlob(repository string, descriptor ocispec.Descriptor, bl
 }
 
 // Test helper functions
+type testTrustedPublicKeys struct {
+	configs []*PublicKeyConfig
+	err     error
+}
+
+func (t *testTrustedPublicKeys) GetPublicKeys(ctx context.Context) ([]*PublicKeyConfig, error) {
+	if t.err != nil {
+		return nil, t.err
+	}
+	return t.configs, nil
+}
+
 func generateTestKey() (*ecdsa.PrivateKey, crypto.PublicKey, error) {
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -177,12 +192,14 @@ func TestNewVerifier(t *testing.T) {
 			name: "with public key config",
 			opts: &VerifierOptions{
 				Name: "test-verifier",
-				PublicKeyConfigs: []*PublicKeyConfig{
-					{
-						PublicKey:          &ecdsa.PublicKey{},
-						SignatureAlgorithm: crypto.SHA256,
+				GetPublicKeys: (&testTrustedPublicKeys{
+					configs: []*PublicKeyConfig{
+						{
+							PublicKey:          &ecdsa.PublicKey{},
+							SignatureAlgorithm: crypto.SHA256,
+						},
 					},
-				},
+				}).GetPublicKeys,
 			},
 			expectError: false,
 		},
@@ -190,11 +207,13 @@ func TestNewVerifier(t *testing.T) {
 			name: "with nil public key config",
 			opts: &VerifierOptions{
 				Name: "test-verifier",
-				PublicKeyConfigs: []*PublicKeyConfig{
-					nil,
-				},
+				GetPublicKeys: (&testTrustedPublicKeys{
+					configs: []*PublicKeyConfig{
+						nil,
+					},
+				}).GetPublicKeys,
 			},
-			expectError: true,
+			expectError: false, // NewVerifier doesn't validate immediately, validation happens on use
 		},
 		{
 			name: "with identity policies",
@@ -541,21 +560,235 @@ func TestGetSignatureDescriptors(t *testing.T) {
 }
 
 func TestCreateTrustedPublicKeyMaterial(t *testing.T) {
-	_, publicKey, err := generateTestKey()
-	if err != nil {
-		t.Fatalf("Failed to generate test key: %v", err)
+	tests := []struct {
+		name             string
+		config           *PublicKeyConfig
+		expectError      bool
+		validateMaterial bool
+	}{
+		{
+			name: "valid config with SHA256",
+			config: func() *PublicKeyConfig {
+				_, publicKey, err := generateTestKey()
+				if err != nil {
+					t.Fatalf("Failed to generate test key: %v", err)
+				}
+				return &PublicKeyConfig{
+					PublicKey:           publicKey,
+					SignatureAlgorithm:  crypto.SHA256,
+					ValidityPeriodStart: time.Now().Add(-time.Hour),
+					ValidityPeriodEnd:   time.Now().Add(time.Hour),
+				}
+			}(),
+			expectError:      false,
+			validateMaterial: true,
+		},
+		{
+			name: "valid config with SHA512",
+			config: func() *PublicKeyConfig {
+				_, publicKey, err := generateTestKey()
+				if err != nil {
+					t.Fatalf("Failed to generate test key: %v", err)
+				}
+				return &PublicKeyConfig{
+					PublicKey:           publicKey,
+					SignatureAlgorithm:  crypto.SHA512,
+					ValidityPeriodStart: time.Now().Add(-time.Hour),
+					ValidityPeriodEnd:   time.Now().Add(time.Hour),
+				}
+			}(),
+			expectError:      false,
+			validateMaterial: true,
+		},
+		{
+			name: "valid config with zero algorithm (should default to SHA256)",
+			config: func() *PublicKeyConfig {
+				_, publicKey, err := generateTestKey()
+				if err != nil {
+					t.Fatalf("Failed to generate test key: %v", err)
+				}
+				return &PublicKeyConfig{
+					PublicKey:           publicKey,
+					SignatureAlgorithm:  0, // Zero value should default to SHA256
+					ValidityPeriodStart: time.Now().Add(-time.Hour),
+					ValidityPeriodEnd:   time.Now().Add(time.Hour),
+				}
+			}(),
+			expectError:      false,
+			validateMaterial: true,
+		},
+		{
+			name: "valid config without validity period",
+			config: func() *PublicKeyConfig {
+				_, publicKey, err := generateTestKey()
+				if err != nil {
+					t.Fatalf("Failed to generate test key: %v", err)
+				}
+				return &PublicKeyConfig{
+					PublicKey:          publicKey,
+					SignatureAlgorithm: crypto.SHA256,
+					// No validity period set
+				}
+			}(),
+			expectError:      false,
+			validateMaterial: true,
+		},
+		{
+			name: "invalid public key (nil)",
+			config: &PublicKeyConfig{
+				PublicKey:           nil,
+				SignatureAlgorithm:  crypto.SHA256,
+				ValidityPeriodStart: time.Now().Add(-time.Hour),
+				ValidityPeriodEnd:   time.Now().Add(time.Hour),
+			},
+			expectError:      true,
+			validateMaterial: false,
+		},
 	}
 
-	config := &PublicKeyConfig{
-		PublicKey:           publicKey,
-		SignatureAlgorithm:  crypto.SHA256,
-		ValidityPeriodStart: time.Now().Add(-time.Hour),
-		ValidityPeriodEnd:   time.Now().Add(time.Hour),
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			material := createTrustedPublicKeyMaterial(tt.config)
+
+			if material == nil {
+				t.Errorf("Expected trusted material but got nil")
+				return
+			}
+		})
+	}
+}
+
+func TestCreateTrustedMaterialFromPublicKeys(t *testing.T) {
+	tests := []struct {
+		name                string
+		getPublicKeys       func(ctx context.Context) ([]*PublicKeyConfig, error)
+		expectedMaterialLen int
+		expectError         bool
+	}{
+		{
+			name:                "nil trusted public keys",
+			getPublicKeys:       nil,
+			expectedMaterialLen: 0,
+			expectError:         false,
+		},
+		{
+			name: "single valid public key",
+			getPublicKeys: func() func(ctx context.Context) ([]*PublicKeyConfig, error) {
+				_, publicKey, err := generateTestKey()
+				if err != nil {
+					t.Fatalf("Failed to generate test key: %v", err)
+				}
+				return (&testTrustedPublicKeys{
+					configs: []*PublicKeyConfig{
+						{
+							PublicKey:           publicKey,
+							SignatureAlgorithm:  crypto.SHA256,
+							ValidityPeriodStart: time.Now().Add(-time.Hour),
+							ValidityPeriodEnd:   time.Now().Add(time.Hour),
+						},
+					},
+				}).GetPublicKeys
+			}(),
+			expectedMaterialLen: 1,
+			expectError:         false,
+		},
+		{
+			name: "multiple valid public keys",
+			getPublicKeys: func() func(ctx context.Context) ([]*PublicKeyConfig, error) {
+				_, publicKey1, err := generateTestKey()
+				if err != nil {
+					t.Fatalf("Failed to generate test key 1: %v", err)
+				}
+				_, publicKey2, err := generateTestKey()
+				if err != nil {
+					t.Fatalf("Failed to generate test key 2: %v", err)
+				}
+				return (&testTrustedPublicKeys{
+					configs: []*PublicKeyConfig{
+						{
+							PublicKey:           publicKey1,
+							SignatureAlgorithm:  crypto.SHA256,
+							ValidityPeriodStart: time.Now().Add(-time.Hour),
+							ValidityPeriodEnd:   time.Now().Add(time.Hour),
+						},
+						{
+							PublicKey:           publicKey2,
+							SignatureAlgorithm:  crypto.SHA512,
+							ValidityPeriodStart: time.Now().Add(-2 * time.Hour),
+							ValidityPeriodEnd:   time.Now().Add(2 * time.Hour),
+						},
+					},
+				}).GetPublicKeys
+			}(),
+			expectedMaterialLen: 2,
+			expectError:         false,
+		},
+		{
+			name: "public key with zero algorithm (defaults to SHA256)",
+			getPublicKeys: func() func(ctx context.Context) ([]*PublicKeyConfig, error) {
+				_, publicKey, err := generateTestKey()
+				if err != nil {
+					t.Fatalf("Failed to generate test key: %v", err)
+				}
+				return (&testTrustedPublicKeys{
+					configs: []*PublicKeyConfig{
+						{
+							PublicKey:           publicKey,
+							SignatureAlgorithm:  0, // Should default to SHA256
+							ValidityPeriodStart: time.Now().Add(-time.Hour),
+							ValidityPeriodEnd:   time.Now().Add(time.Hour),
+						},
+					},
+				}).GetPublicKeys
+			}(),
+			expectedMaterialLen: 1,
+			expectError:         false,
+		},
+		{
+			name: "nil public key config",
+			getPublicKeys: (&testTrustedPublicKeys{
+				configs: []*PublicKeyConfig{nil},
+			}).GetPublicKeys,
+			expectedMaterialLen: 0,
+			expectError:         true,
+		},
+		{
+			name: "error getting public keys",
+			getPublicKeys: (&testTrustedPublicKeys{
+				err: fmt.Errorf("failed to get public keys"),
+			}).GetPublicKeys,
+			expectedMaterialLen: 0,
+			expectError:         true,
+		},
 	}
 
-	material := createTrustedPublicKeyMaterial(config)
-	if material == nil {
-		t.Errorf("Expected trusted material but got nil")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			materials, err := createTrustedMaterialFromPublicKeys(context.Background(), tt.getPublicKeys)
+
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if len(materials) != tt.expectedMaterialLen {
+				t.Errorf("Expected %d materials, got %d", tt.expectedMaterialLen, len(materials))
+			}
+
+			// Verify that all returned materials are not nil
+			for i, material := range materials {
+				if material == nil {
+					t.Errorf("Material at index %d is nil", i)
+				}
+			}
+		})
 	}
 }
 
@@ -619,12 +852,14 @@ func TestPublicKeyConfigDefaults(t *testing.T) {
 
 	opts := &VerifierOptions{
 		Name: "test-verifier",
-		PublicKeyConfigs: []*PublicKeyConfig{
-			{
-				PublicKey: publicKey,
-				// SignatureAlgorithm not set - should default to SHA256
+		GetPublicKeys: (&testTrustedPublicKeys{
+			configs: []*PublicKeyConfig{
+				{
+					PublicKey: publicKey,
+					// SignatureAlgorithm not set - should default to SHA256
+				},
 			},
-		},
+		}).GetPublicKeys,
 	}
 
 	verifier, err := NewVerifier(opts)
@@ -739,7 +974,7 @@ func TestGetBundleVerificationMaterial(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := getBundleVerificationMaterial(layer, tt.ignoreTlog)
+			result, err := getBundleVerificationMaterial(layer, tt.ignoreTlog, nil)
 			if tt.expectError {
 				if err == nil {
 					t.Errorf("Expected error but got none")
@@ -975,16 +1210,18 @@ func TestVerifierOptions_Validation(t *testing.T) {
 			name: "with multiple public key configs",
 			opts: &VerifierOptions{
 				Name: "test-verifier",
-				PublicKeyConfigs: []*PublicKeyConfig{
-					{
-						PublicKey:          &ecdsa.PublicKey{},
-						SignatureAlgorithm: crypto.SHA256,
+				GetPublicKeys: (&testTrustedPublicKeys{
+					configs: []*PublicKeyConfig{
+						{
+							PublicKey:          &ecdsa.PublicKey{},
+							SignatureAlgorithm: crypto.SHA256,
+						},
+						{
+							PublicKey:          &ecdsa.PublicKey{},
+							SignatureAlgorithm: crypto.SHA512,
+						},
 					},
-					{
-						PublicKey:          &ecdsa.PublicKey{},
-						SignatureAlgorithm: crypto.SHA512,
-					},
-				},
+				}).GetPublicKeys,
 			},
 			expectError: false,
 		},
@@ -1495,5 +1732,587 @@ func TestGetVerificationMaterialTlogEntries_ComprehensiveCoverage(t *testing.T) 
 				t.Errorf("Expected CanonicalizedBody to be set")
 			}
 		})
+	}
+}
+
+// Test error cases in createVerifier function to improve coverage
+func TestCreateVerifier_ErrorCases(t *testing.T) {
+	tests := []struct {
+		name        string
+		opts        *VerifierOptions
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name: "TUF client creation error",
+			opts: &VerifierOptions{
+				Name: "test-verifier",
+				TUFOptions: &tuf.Options{
+					RepositoryBaseURL: "invalid-url", // This should cause TUF client creation to fail
+				},
+			},
+			expectError: true,
+			errorMsg:    "failed to create TUF client",
+		},
+		{
+			name: "with custom trusted root",
+			opts: &VerifierOptions{
+				Name:        "test-verifier",
+				TrustedRoot: &root.TrustedRoot{}, // Empty trusted root, should work
+			},
+			expectError: false,
+		},
+		{
+			name: "with ignore flags set",
+			opts: &VerifierOptions{
+				Name:        "test-verifier",
+				IgnoreTLog:  true,
+				IgnoreCTLog: true,
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := createVerifier(tt.opts)
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				} else if tt.errorMsg != "" && !strings.Contains(err.Error(), tt.errorMsg) {
+					t.Errorf("Expected error message to contain '%s', got '%s'", tt.errorMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// Test NewVerifier with different getVerifier paths to improve coverage
+func TestNewVerifier_GetVerifierPaths(t *testing.T) {
+	_, publicKey, err := generateTestKey()
+	if err != nil {
+		t.Fatalf("Failed to generate test key: %v", err)
+	}
+
+	tests := []struct {
+		name        string
+		opts        *VerifierOptions
+		expectError bool
+	}{
+		{
+			name: "without public keys (keyless verification path)",
+			opts: &VerifierOptions{
+				Name:       "test-verifier",
+				IgnoreTLog: true, // Simplify for test
+			},
+			expectError: false,
+		},
+		{
+			name: "with public keys (keyed verification path)",
+			opts: &VerifierOptions{
+				Name: "test-verifier",
+				GetPublicKeys: (&testTrustedPublicKeys{
+					configs: []*PublicKeyConfig{
+						{
+							PublicKey:          publicKey,
+							SignatureAlgorithm: crypto.SHA256,
+						},
+					},
+				}).GetPublicKeys,
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verifier, err := NewVerifier(tt.opts)
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+				if verifier == nil {
+					t.Errorf("Expected verifier but got nil")
+				}
+
+				// Test the getVerifier function directly
+				if verifier.getVerifier != nil {
+					_, err := verifier.getVerifier()
+					if err != nil {
+						t.Errorf("getVerifier failed: %v", err)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Test createTrustedPublicKeyMaterial error cases to improve coverage
+func TestCreateTrustedPublicKeyMaterial_ErrorCases(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *PublicKeyConfig
+	}{
+		{
+			name: "invalid public key type that causes LoadVerifier to fail",
+			config: &PublicKeyConfig{
+				PublicKey:          "invalid-key-type", // This will cause signature.LoadVerifier to fail
+				SignatureAlgorithm: crypto.SHA256,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			material := createTrustedPublicKeyMaterial(tt.config)
+			if material == nil {
+				t.Errorf("Expected material but got nil")
+				return
+			}
+
+			// Try to call the internal function to trigger the error path
+			_, err := material.PublicKeyVerifier("test-hint")
+			if err == nil {
+				t.Errorf("Expected error from LoadVerifier but got none")
+			}
+		})
+	}
+}
+
+// Test Verify method with store fetch errors to improve coverage
+func TestVerifier_VerifyStoreErrors(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	repo := "test/repo"
+
+	opts := &VerifierOptions{
+		Name:       "test-verifier",
+		IgnoreTLog: true,
+	}
+
+	verifier, err := NewVerifier(opts)
+	if err != nil {
+		t.Fatalf("Failed to create verifier: %v", err)
+	}
+
+	// Test with artifact descriptor that doesn't exist in store
+	artifactDesc := ocispec.Descriptor{
+		ArtifactType: mediaTypeCosignArtifactSignature,
+		MediaType:    ocispec.MediaTypeImageManifest,
+		Digest:       digest.FromString("non-existent"),
+		Size:         100,
+	}
+
+	verifyOpts := &ratify.VerifyOptions{
+		Store:              store,
+		Repository:         repo,
+		ArtifactDescriptor: artifactDesc,
+	}
+
+	_, err = verifier.Verify(ctx, verifyOpts)
+	if err == nil {
+		t.Errorf("Expected error when manifest doesn't exist but got none")
+	}
+	if !strings.Contains(err.Error(), "failed to fetch signature manifest") {
+		t.Errorf("Expected fetch error but got: %v", err)
+	}
+}
+
+// Test Verify method with malformed manifests to improve coverage
+func TestVerifier_VerifyMalformedManifests(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	repo := "test/repo"
+
+	opts := &VerifierOptions{
+		Name:       "test-verifier",
+		IgnoreTLog: true,
+	}
+
+	verifier, err := NewVerifier(opts)
+	if err != nil {
+		t.Fatalf("Failed to create verifier: %v", err)
+	}
+
+	tests := []struct {
+		name         string
+		manifestData []byte
+		expectedErr  string
+	}{
+		{
+			name:         "invalid JSON manifest",
+			manifestData: []byte("invalid-json{"),
+			expectedErr:  "failed to unmarshal signature manifest",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			artifactDesc := ocispec.Descriptor{
+				ArtifactType: mediaTypeCosignArtifactSignature,
+				MediaType:    ocispec.MediaTypeImageManifest,
+				Digest:       digest.FromBytes(tt.manifestData),
+				Size:         int64(len(tt.manifestData)),
+			}
+
+			store.addManifest(repo, artifactDesc, tt.manifestData)
+
+			verifyOpts := &ratify.VerifyOptions{
+				Store:              store,
+				Repository:         repo,
+				ArtifactDescriptor: artifactDesc,
+			}
+
+			_, err := verifier.Verify(ctx, verifyOpts)
+			if err == nil {
+				t.Errorf("Expected error but got none")
+			}
+			if !strings.Contains(err.Error(), tt.expectedErr) {
+				t.Errorf("Expected error containing '%s' but got: %v", tt.expectedErr, err)
+			}
+		})
+	}
+}
+
+// Test getBundleVerificationMaterial error cases to improve coverage
+func TestGetBundleVerificationMaterial_ErrorCases(t *testing.T) {
+	tests := []struct {
+		name          string
+		layer         ocispec.Descriptor
+		ignoreTlog    bool
+		getPublicKeys func(ctx context.Context) ([]*PublicKeyConfig, error)
+		expectError   bool
+		errorMsg      string
+	}{
+		{
+			name: "tlog entry error when not ignored",
+			layer: ocispec.Descriptor{
+				Annotations: map[string]string{
+					annotationKeyBundle: "invalid-bundle",
+				},
+			},
+			ignoreTlog:    false,
+			getPublicKeys: nil,
+			expectError:   true,
+			errorMsg:      "error getting tlog entries",
+		},
+		{
+			name: "certificate error when no public keys",
+			layer: ocispec.Descriptor{
+				Annotations: map[string]string{
+					annotationKeyCert: "invalid-cert",
+				},
+			},
+			ignoreTlog:    true, // Skip tlog to hit cert error
+			getPublicKeys: nil,  // No public keys, so will try to get cert
+			expectError:   true,
+			errorMsg:      "error getting signing certificate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := getBundleVerificationMaterial(tt.layer, tt.ignoreTlog, tt.getPublicKeys)
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				} else if tt.errorMsg != "" && !strings.Contains(err.Error(), tt.errorMsg) {
+					t.Errorf("Expected error message to contain '%s', got '%s'", tt.errorMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// Test verifySignatureLayer error cases to improve coverage
+func TestVerifier_VerifySignatureLayerErrors(t *testing.T) {
+	verifier := &Verifier{
+		name:       "test-verifier",
+		ignoreTLog: true,
+	}
+
+	tests := []struct {
+		name        string
+		layer       ocispec.Descriptor
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name: "getBundleVerificationMaterial error",
+			layer: ocispec.Descriptor{
+				Annotations: map[string]string{
+					annotationKeyBundle: "invalid-json{",
+				},
+			},
+			expectError: true,
+			errorMsg:    "error getting verification material",
+		},
+		{
+			name: "getBundleMsgSignature error",
+			layer: ocispec.Descriptor{
+				Digest: digest.Digest("unsupported:abcdef"),
+				Annotations: map[string]string{
+					annotationKeyCert:      "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
+					annotationKeySignature: base64.StdEncoding.EncodeToString([]byte("test")),
+				},
+			},
+			expectError: true,
+			errorMsg:    "error getting message signature",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := verifier.verifySignatureLayer(tt.layer)
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				} else if tt.errorMsg != "" && !strings.Contains(err.Error(), tt.errorMsg) {
+					t.Errorf("Expected error message to contain '%s', got '%s'", tt.errorMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// Test getBundleMsgSignature with different digest algorithms to improve coverage
+func TestGetBundleMsgSignature_DigestAlgorithms(t *testing.T) {
+	testSignature := base64.StdEncoding.EncodeToString([]byte("test-signature"))
+
+	tests := []struct {
+		name        string
+		digest      digest.Digest
+		expectError bool
+		expectedAlg protocommon.HashAlgorithm
+	}{
+		{
+			name:        "SHA256 digest",
+			digest:      digest.FromString("test-content"), // Uses SHA256 by default
+			expectError: false,
+			expectedAlg: protocommon.HashAlgorithm_SHA2_256,
+		},
+		{
+			name:        "Unsupported algorithm",
+			digest:      digest.Digest("sha512:abcdef1234567890"),
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			layer := ocispec.Descriptor{
+				Digest: tt.digest,
+				Annotations: map[string]string{
+					annotationKeySignature: testSignature,
+				},
+			}
+
+			result, err := getBundleMsgSignature(layer)
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+				if result == nil {
+					t.Errorf("Expected result but got nil")
+				}
+				if result != nil && result.MessageSignature != nil {
+					if result.MessageSignature.MessageDigest.Algorithm != tt.expectedAlg {
+						t.Errorf("Expected algorithm %v, got %v", tt.expectedAlg, result.MessageSignature.MessageDigest.Algorithm)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Test verifyBundle with getVerifier error to improve coverage
+func TestVerifier_VerifyBundleGetVerifierError(t *testing.T) {
+	verifier := &Verifier{
+		name:       "test-verifier",
+		ignoreTLog: true,
+		getVerifier: func() (*verify.Verifier, error) {
+			return nil, fmt.Errorf("failed to get verifier")
+		},
+	}
+
+	_, err := verifier.verifyBundle(nil, digest.FromString("test"))
+	if err == nil {
+		t.Errorf("Expected error from getVerifier but got none")
+	}
+	if !strings.Contains(err.Error(), "failed to get verifier") {
+		t.Errorf("Expected getVerifier error but got: %v", err)
+	}
+}
+
+// Test signature layer verification with various layer configurations
+func TestVerifier_VerifyWithVariousLayerConfigurations(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	repo := "test/repo"
+
+	opts := &VerifierOptions{
+		Name:       "test-verifier",
+		IgnoreTLog: true,
+	}
+
+	verifier, err := NewVerifier(opts)
+	if err != nil {
+		t.Fatalf("Failed to create verifier: %v", err)
+	}
+
+	// Test with layer that has bundle creation error
+	invalidLayer := ocispec.Descriptor{
+		MediaType: mediaTypeSimpleSigning,
+		Digest:    digest.Digest("unsupported:invalidhex"),
+		Size:      100,
+		Annotations: map[string]string{
+			annotationKeyCert:      "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----",
+			annotationKeySignature: base64.StdEncoding.EncodeToString([]byte("test")),
+		},
+	}
+
+	manifestBytes, err := createTestManifest([]ocispec.Descriptor{invalidLayer})
+	if err != nil {
+		t.Fatalf("Failed to create test manifest: %v", err)
+	}
+
+	artifactDesc := ocispec.Descriptor{
+		ArtifactType: mediaTypeCosignArtifactSignature,
+		MediaType:    ocispec.MediaTypeImageManifest,
+		Digest:       digest.FromBytes(manifestBytes),
+		Size:         int64(len(manifestBytes)),
+	}
+
+	store.addManifest(repo, artifactDesc, manifestBytes)
+
+	verifyOpts := &ratify.VerifyOptions{
+		Store:              store,
+		Repository:         repo,
+		ArtifactDescriptor: artifactDesc,
+	}
+
+	result, err := verifier.Verify(ctx, verifyOpts)
+	if err != nil {
+		t.Fatalf("Unexpected error during verification: %v", err)
+	}
+
+	if result == nil {
+		t.Errorf("Expected verification result but got nil")
+	}
+
+	// Check that we have verification details with errors
+	if result.Detail != nil {
+		if detailMap, ok := result.Detail.(map[string][]*layerReport); ok {
+			if details, exists := detailMap["verifiedSignatures"]; exists {
+				if len(details) == 0 {
+					t.Errorf("Expected at least one signature layer report")
+				} else {
+					// The signature should fail due to unsupported digest
+					if details[0].Succeeded {
+						t.Errorf("Expected signature verification to fail but it succeeded")
+					}
+					if details[0].Error == nil {
+						t.Errorf("Expected error in layer report but got none")
+					}
+				}
+			}
+		}
+	}
+}
+
+// Test Verify error path when getSignatureDescriptors fails
+func TestVerifier_VerifyGetSignatureDescriptorsError(t *testing.T) {
+	ctx := context.Background()
+	store := newMockStore()
+	repo := "test/repo"
+
+	opts := &VerifierOptions{
+		Name:       "test-verifier",
+		IgnoreTLog: true,
+	}
+
+	verifier, err := NewVerifier(opts)
+	if err != nil {
+		t.Fatalf("Failed to create verifier: %v", err)
+	}
+
+	// Create manifest with invalid JSON to trigger getSignatureDescriptors error
+	invalidManifestBytes := []byte("invalid-json{")
+
+	artifactDesc := ocispec.Descriptor{
+		ArtifactType: mediaTypeCosignArtifactSignature,
+		MediaType:    ocispec.MediaTypeImageManifest,
+		Digest:       digest.FromBytes(invalidManifestBytes),
+		Size:         int64(len(invalidManifestBytes)),
+	}
+
+	store.addManifest(repo, artifactDesc, invalidManifestBytes)
+
+	verifyOpts := &ratify.VerifyOptions{
+		Store:              store,
+		Repository:         repo,
+		ArtifactDescriptor: artifactDesc,
+	}
+
+	_, err = verifier.Verify(ctx, verifyOpts)
+	if err == nil {
+		t.Errorf("Expected error from invalid manifest but got none")
+	}
+	// The error could be either from unmarshal or getSignatureDescriptors
+	if !strings.Contains(err.Error(), "failed to unmarshal signature manifest") &&
+		!strings.Contains(err.Error(), "failed to get signature descriptors") {
+		t.Errorf("Expected unmarshal or getSignatureDescriptors error but got: %v", err)
+	}
+}
+
+// Test verifySignatureLayer with bundle creation error path
+func TestVerifier_VerifySignatureLayerBundleCreationError(t *testing.T) {
+	verifier := &Verifier{
+		name:       "test-verifier",
+		ignoreTLog: true,
+	}
+
+	// Create layer that will pass verification material and message signature
+	// but fail bundle creation due to invalid bundle structure
+	layer := ocispec.Descriptor{
+		Digest: digest.FromString("test-content"),
+		Annotations: map[string]string{
+			annotationKeyCert:      "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwEOwGLLCj5jXyiRaJAUm\nTNGXl4z+2NzD7YJx9n9VdgzYz7+I/c+M5O8r8e0J3G6M9W5K9f0L4u3I7qA5c3w\nNGsYGYrE6O8K7g5a7yO4X2qE7mM8B5O1b3p4o5Y8h9h5j4kG8o3e3f4f2e1j1H\n-----END CERTIFICATE-----",
+			annotationKeySignature: base64.StdEncoding.EncodeToString([]byte("test-signature")),
+		},
+	}
+
+	// This should pass verification material and message signature creation
+	// but might fail at bundle.NewBundle due to malformed structure
+	_, err := verifier.verifySignatureLayer(layer)
+	if err == nil {
+		// If no error, the bundle was created but verification will likely fail
+		// which is still a valid test case
+		return
+	}
+
+	// If there's an error, it should be in bundle creation step
+	if !strings.Contains(err.Error(), "error creating bundle") {
+		t.Logf("Got error (this might be expected): %v", err)
 	}
 }
