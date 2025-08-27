@@ -54,10 +54,10 @@ flowchart TD
     end
     subgraph Verification Workflow
         VU(EndUser) -->|1.Verify Input|VR[Cosign Verifier]
-        VR -->|7.Requests Log Proof| REKOR
+        VR -->|6.Requests Log Proof| REKOR
         VR ---->|4.Requests Root Certificates| TR
         TR ---->|5.Provides Root Certificates| VR
-        REKOR -->|6.Provides Proof| VR 
+        REKOR -->|7.Provides Proof| VR 
         VR -->|8.Provides Verify Result| VU
     end
     subgraph OCI Distribution        
