@@ -19,11 +19,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 
+	"github.com/notaryproject/notation-core-go/revocation"
+	corecrl "github.com/notaryproject/notation-core-go/revocation/crl"
+	"github.com/notaryproject/notation-core-go/revocation/purpose"
 	"github.com/notaryproject/notation-go"
+	"github.com/notaryproject/notation-go/dir"
 	"github.com/notaryproject/notation-go/plugin"
 	notationRegistry "github.com/notaryproject/notation-go/registry"
 	"github.com/notaryproject/notation-go/verifier"
+	notationcrl "github.com/notaryproject/notation-go/verifier/crl"
 	"github.com/notaryproject/notation-go/verifier/trustpolicy"
 	"github.com/notaryproject/notation-go/verifier/truststore"
 	"github.com/notaryproject/ratify-go"
@@ -53,6 +59,27 @@ type VerifierOptions struct {
 	// https://github.com/notaryproject/notation-go/blob/v1.3.0/plugin/manager.go#L33
 	// Optional.
 	PluginManager plugin.Manager
+
+	// CRL configures certificate revocation list checks. Optional. When set,
+	// missing revocation validators are created using the configured CRL fetcher.
+	CRL *CRLOptions
+
+	// RevocationCodeSigningValidator validates revocation status of the code
+	// signing certificate chain. Optional. If unset and CRL is set, a validator
+	// is created automatically.
+	RevocationCodeSigningValidator revocation.Validator
+
+	// RevocationTimestampingValidator validates revocation status of the
+	// timestamping certificate chain. Optional. If unset and CRL is set, a
+	// validator is created automatically.
+	RevocationTimestampingValidator revocation.Validator
+}
+
+// CRLOptions contains options for CRL revocation checking.
+type CRLOptions struct {
+	// CacheEnabled enables file-backed CRL caching using Notation's cache
+	// directory. Optional.
+	CacheEnabled bool
 }
 
 // Verifier is a ratify.Verifier implementation that verifies Notation
@@ -64,7 +91,11 @@ type Verifier struct {
 
 // NewVerifier creates a new Notation verifier.
 func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
-	v, err := verifier.New(opts.TrustPolicyDoc, opts.TrustStore, opts.PluginManager)
+	verifierOpts, err := newVerifierOptions(opts)
+	if err != nil {
+		return nil, err
+	}
+	v, err := verifier.NewWithOptions(opts.TrustPolicyDoc, opts.TrustStore, opts.PluginManager, verifierOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create notation verifier: %w", err)
 	}
@@ -73,6 +104,63 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 		name:     opts.Name,
 		verifier: v,
 	}, nil
+}
+
+func newVerifierOptions(opts *VerifierOptions) (verifier.VerifierOptions, error) {
+	verifierOpts := verifier.VerifierOptions{
+		RevocationCodeSigningValidator:  opts.RevocationCodeSigningValidator,
+		RevocationTimestampingValidator: opts.RevocationTimestampingValidator,
+	}
+	if opts.CRL == nil {
+		return verifierOpts, nil
+	}
+
+	crlFetcher, err := newCRLFetcher(opts.CRL.CacheEnabled)
+	if err != nil {
+		return verifierOpts, fmt.Errorf("failed to create CRL fetcher: %w", err)
+	}
+	if verifierOpts.RevocationCodeSigningValidator == nil {
+		validator, err := revocation.NewWithOptions(revocation.Options{
+			CRLFetcher:       crlFetcher,
+			CertChainPurpose: purpose.CodeSigning,
+		})
+		if err != nil {
+			return verifierOpts, fmt.Errorf("failed to create code signing revocation validator: %w", err)
+		}
+		verifierOpts.RevocationCodeSigningValidator = validator
+	}
+	if verifierOpts.RevocationTimestampingValidator == nil {
+		validator, err := revocation.NewWithOptions(revocation.Options{
+			CRLFetcher:       crlFetcher,
+			CertChainPurpose: purpose.Timestamping,
+		})
+		if err != nil {
+			return verifierOpts, fmt.Errorf("failed to create timestamping revocation validator: %w", err)
+		}
+		verifierOpts.RevocationTimestampingValidator = validator
+	}
+	return verifierOpts, nil
+}
+
+func newCRLFetcher(cacheEnabled bool) (corecrl.Fetcher, error) {
+	fetcher, err := corecrl.NewHTTPFetcher(&http.Client{})
+	if err != nil {
+		return nil, err
+	}
+	if !cacheEnabled {
+		return fetcher, nil
+	}
+
+	cacheRoot, err := dir.CacheFS().SysPath(dir.PathCRLCache)
+	if err != nil {
+		return nil, err
+	}
+	cache, err := notationcrl.NewFileCache(cacheRoot)
+	if err != nil {
+		return nil, err
+	}
+	fetcher.Cache = cache
+	return fetcher, nil
 }
 
 // Name returns the name of the verifier.

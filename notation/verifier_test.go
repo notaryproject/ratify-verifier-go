@@ -23,8 +23,12 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/notaryproject/notation-core-go/revocation"
+	corecrl "github.com/notaryproject/notation-core-go/revocation/crl"
+	"github.com/notaryproject/notation-core-go/revocation/result"
 	"github.com/notaryproject/notation-core-go/signature"
 	"github.com/notaryproject/notation-go"
+	"github.com/notaryproject/notation-go/dir"
 	"github.com/notaryproject/notation-go/verifier/trustpolicy"
 	"github.com/notaryproject/notation-go/verifier/truststore"
 	"github.com/notaryproject/ratify-go"
@@ -48,6 +52,12 @@ var notationSignatureArtifact = ocispec.Descriptor{
 type mockTrustStore struct{}
 
 func (m *mockTrustStore) GetCertificates(_ context.Context, _ truststore.Type, _ string) ([]*x509.Certificate, error) {
+	return nil, nil
+}
+
+type mockRevocationValidator struct{}
+
+func (m mockRevocationValidator) ValidateContext(context.Context, revocation.ValidateContextOptions) ([]*result.CertRevocationResult, error) {
 	return nil, nil
 }
 
@@ -149,6 +159,115 @@ func TestNewVerifier(t *testing.T) {
 	if !verifier.Verifiable(notationSignatureArtifact) {
 		t.Fatalf("unexpected artifact type: %s", notationSignatureArtifact.ArtifactType)
 	}
+}
+
+func TestNewVerifierWithCRL(t *testing.T) {
+	oldCacheDir := dir.UserCacheDir
+	dir.UserCacheDir = t.TempDir()
+	t.Cleanup(func() {
+		dir.UserCacheDir = oldCacheDir
+	})
+
+	opts := &VerifierOptions{
+		Name:           testVerifierName,
+		TrustPolicyDoc: testTrustPolicyDocument(),
+		TrustStore:     &mockTrustStore{},
+		CRL: &CRLOptions{
+			CacheEnabled: true,
+		},
+	}
+	verifier, err := NewVerifier(opts)
+	if err != nil {
+		t.Fatalf("failed to create verifier with CRL support: %v", err)
+	}
+	if verifier == nil {
+		t.Fatal("expected verifier with CRL support")
+	}
+}
+
+func TestNewVerifierOptions(t *testing.T) {
+	t.Run("no CRL leaves revocation validators unset", func(t *testing.T) {
+		opts, err := newVerifierOptions(&VerifierOptions{})
+		if err != nil {
+			t.Fatalf("expected verifier options: %v", err)
+		}
+		if opts.RevocationCodeSigningValidator != nil {
+			t.Fatal("expected code signing validator to be unset")
+		}
+		if opts.RevocationTimestampingValidator != nil {
+			t.Fatal("expected timestamping validator to be unset")
+		}
+	})
+
+	t.Run("CRL creates missing revocation validators", func(t *testing.T) {
+		opts, err := newVerifierOptions(&VerifierOptions{
+			CRL: &CRLOptions{},
+		})
+		if err != nil {
+			t.Fatalf("expected verifier options with CRL: %v", err)
+		}
+		if opts.RevocationCodeSigningValidator == nil {
+			t.Fatal("expected code signing validator")
+		}
+		if opts.RevocationTimestampingValidator == nil {
+			t.Fatal("expected timestamping validator")
+		}
+	})
+
+	t.Run("custom validators are preserved", func(t *testing.T) {
+		codeSigningValidator := mockRevocationValidator{}
+		timestampingValidator := mockRevocationValidator{}
+		opts, err := newVerifierOptions(&VerifierOptions{
+			CRL:                             &CRLOptions{},
+			RevocationCodeSigningValidator:  codeSigningValidator,
+			RevocationTimestampingValidator: timestampingValidator,
+		})
+		if err != nil {
+			t.Fatalf("expected verifier options with custom validators: %v", err)
+		}
+		if opts.RevocationCodeSigningValidator != codeSigningValidator {
+			t.Fatal("expected custom code signing validator to be preserved")
+		}
+		if opts.RevocationTimestampingValidator != timestampingValidator {
+			t.Fatal("expected custom timestamping validator to be preserved")
+		}
+	})
+}
+
+func TestNewCRLFetcher(t *testing.T) {
+	t.Run("without cache", func(t *testing.T) {
+		fetcher, err := newCRLFetcher(false)
+		if err != nil {
+			t.Fatalf("expected CRL fetcher: %v", err)
+		}
+		httpFetcher, ok := fetcher.(*corecrl.HTTPFetcher)
+		if !ok {
+			t.Fatalf("expected HTTP fetcher, got %T", fetcher)
+		}
+		if httpFetcher.Cache != nil {
+			t.Fatal("expected CRL cache to be disabled")
+		}
+	})
+
+	t.Run("with cache", func(t *testing.T) {
+		oldCacheDir := dir.UserCacheDir
+		dir.UserCacheDir = t.TempDir()
+		t.Cleanup(func() {
+			dir.UserCacheDir = oldCacheDir
+		})
+
+		fetcher, err := newCRLFetcher(true)
+		if err != nil {
+			t.Fatalf("expected CRL fetcher with cache: %v", err)
+		}
+		httpFetcher, ok := fetcher.(*corecrl.HTTPFetcher)
+		if !ok {
+			t.Fatalf("expected HTTP fetcher, got %T", fetcher)
+		}
+		if httpFetcher.Cache == nil {
+			t.Fatal("expected CRL cache to be enabled")
+		}
+	})
 }
 
 func TestVerify(t *testing.T) {
@@ -272,5 +391,22 @@ func TestVerify(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func testTrustPolicyDocument() *trustpolicy.Document {
+	return &trustpolicy.Document{
+		Version: "1.0",
+		TrustPolicies: []trustpolicy.TrustPolicy{
+			{
+				Name:           "default",
+				RegistryScopes: []string{"*"},
+				SignatureVerification: trustpolicy.SignatureVerification{
+					VerificationLevel: "strict",
+				},
+				TrustStores:       []string{"ca:cert"},
+				TrustedIdentities: []string{"*"},
+			},
+		},
 	}
 }
