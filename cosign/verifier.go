@@ -137,10 +137,17 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 	return &Verifier{
 		getVerifier:      getVerifier,
 		name:             opts.Name,
-		identityPolicies: opts.IdentityPolicies,
+		identityPolicies: getIdentityPolicies(opts),
 		ignoreTLog:       opts.IgnoreTLog,
 		getPublicKeys:    opts.GetPublicKeys,
 	}, nil
+}
+
+func getIdentityPolicies(opts *VerifierOptions) []verify.PolicyOption {
+	if opts.GetPublicKeys == nil {
+		return opts.IdentityPolicies
+	}
+	return append([]verify.PolicyOption{verify.WithKey()}, opts.IdentityPolicies...)
 }
 
 func createVerifier(opts *VerifierOptions) (*verify.Verifier, error) {
@@ -179,13 +186,13 @@ func createVerifier(opts *VerifierOptions) (*verify.Verifier, error) {
 	// Configure transparency log verification
 	if !opts.IgnoreTLog {
 		verifierOpts = append(verifierOpts, verify.WithTransparencyLog(1))
+		verifierOpts = append(verifierOpts, verify.WithObserverTimestamps(1))
+	} else {
+		verifierOpts = append(verifierOpts, verify.WithCurrentTime())
 	}
 
-	// Configure timestamp verification
-	verifierOpts = append(verifierOpts, verify.WithObserverTimestamps(1))
-
 	// Configure certificate transparency log verification
-	if !opts.IgnoreCTLog {
+	if !opts.IgnoreCTLog && opts.GetPublicKeys == nil {
 		verifierOpts = append(verifierOpts, verify.WithSignedCertificateTimestamps(1))
 	}
 
