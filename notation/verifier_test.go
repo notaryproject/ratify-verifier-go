@@ -21,10 +21,18 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/notaryproject/notation-core-go/revocation"
+	corecrl "github.com/notaryproject/notation-core-go/revocation/crl"
+	"github.com/notaryproject/notation-core-go/revocation/result"
 	"github.com/notaryproject/notation-core-go/signature"
 	"github.com/notaryproject/notation-go"
+	"github.com/notaryproject/notation-go/dir"
 	"github.com/notaryproject/notation-go/verifier/trustpolicy"
 	"github.com/notaryproject/notation-go/verifier/truststore"
 	"github.com/notaryproject/ratify-go"
@@ -48,6 +56,12 @@ var notationSignatureArtifact = ocispec.Descriptor{
 type mockTrustStore struct{}
 
 func (m *mockTrustStore) GetCertificates(_ context.Context, _ truststore.Type, _ string) ([]*x509.Certificate, error) {
+	return nil, nil
+}
+
+type mockRevocationValidator struct{}
+
+func (m mockRevocationValidator) ValidateContext(context.Context, revocation.ValidateContextOptions) ([]*result.CertRevocationResult, error) {
 	return nil, nil
 }
 
@@ -148,6 +162,242 @@ func TestNewVerifier(t *testing.T) {
 
 	if !verifier.Verifiable(notationSignatureArtifact) {
 		t.Fatalf("unexpected artifact type: %s", notationSignatureArtifact.ArtifactType)
+	}
+}
+
+func TestNewVerifierValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		opts *VerifierOptions
+	}{
+		{name: "nil options", opts: nil},
+		{name: "empty name", opts: &VerifierOptions{TrustPolicyDoc: testTrustPolicyDocument(), TrustStore: &mockTrustStore{}}},
+		{name: "nil trust policy", opts: &VerifierOptions{Name: testVerifierName, TrustStore: &mockTrustStore{}}},
+		{name: "nil trust store", opts: &VerifierOptions{Name: testVerifierName, TrustPolicyDoc: testTrustPolicyDocument()}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NewVerifier(test.opts); err == nil {
+				t.Fatal("expected error for invalid options, got nil")
+			}
+		})
+	}
+}
+
+func TestNewVerifierWithCRL(t *testing.T) {
+	oldCacheDir := dir.UserCacheDir
+	dir.UserCacheDir = t.TempDir()
+	t.Cleanup(func() {
+		dir.UserCacheDir = oldCacheDir
+	})
+
+	opts := &VerifierOptions{
+		Name:           testVerifierName,
+		TrustPolicyDoc: testTrustPolicyDocument(),
+		TrustStore:     &mockTrustStore{},
+		CRL:            &CRLOptions{CacheEnabled: true},
+	}
+	verifier, err := NewVerifier(opts)
+	if err != nil {
+		t.Fatalf("failed to create verifier with CRL support: %v", err)
+	}
+	if verifier == nil {
+		t.Fatal("expected verifier with CRL support")
+	}
+}
+
+func TestRevocationValidators(t *testing.T) {
+	t.Run("creates code signing and timestamping validators", func(t *testing.T) {
+		codeSigning, timestamping, err := newCRLHandler().revocationValidators(&CRLOptions{})
+		if err != nil {
+			t.Fatalf("expected revocation validators: %v", err)
+		}
+		if codeSigning == nil {
+			t.Fatal("expected code signing validator")
+		}
+		if timestamping == nil {
+			t.Fatal("expected timestamping validator")
+		}
+	})
+}
+
+func TestNewCRLFetcher(t *testing.T) {
+	t.Run("without cache", func(t *testing.T) {
+		fetcher, err := newCRLHandler().newFetcher(&CRLOptions{})
+		if err != nil {
+			t.Fatalf("expected CRL fetcher: %v", err)
+		}
+		httpFetcher, ok := fetcher.(*corecrl.HTTPFetcher)
+		if !ok {
+			t.Fatalf("expected HTTP fetcher, got %T", fetcher)
+		}
+		if httpFetcher.Cache != nil {
+			t.Fatal("expected CRL cache to be disabled")
+		}
+	})
+
+	t.Run("with cache", func(t *testing.T) {
+		oldCacheDir := dir.UserCacheDir
+		dir.UserCacheDir = t.TempDir()
+		t.Cleanup(func() {
+			dir.UserCacheDir = oldCacheDir
+		})
+
+		fetcher, err := newCRLHandler().newFetcher(&CRLOptions{CacheEnabled: true})
+		if err != nil {
+			t.Fatalf("expected CRL fetcher with cache: %v", err)
+		}
+		httpFetcher, ok := fetcher.(*corecrl.HTTPFetcher)
+		if !ok {
+			t.Fatalf("expected HTTP fetcher, got %T", fetcher)
+		}
+		if httpFetcher.Cache == nil {
+			t.Fatal("expected CRL cache to be enabled")
+		}
+	})
+}
+
+func TestResolveTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    time.Duration
+		expected time.Duration
+	}{
+		{name: "zero uses fallback", input: 0, expected: defaultCRLFetchTimeout},
+		{name: "negative uses fallback", input: -1 * time.Second, expected: defaultCRLFetchTimeout},
+		{name: "positive is preserved", input: 5 * time.Second, expected: 5 * time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := resolveTimeout(test.input, defaultCRLFetchTimeout); got != test.expected {
+				t.Fatalf("expected %v, got %v", test.expected, got)
+			}
+		})
+	}
+}
+
+func TestNewVerifierInvalidTrustPolicy(t *testing.T) {
+	opts := &VerifierOptions{
+		Name:           testVerifierName,
+		TrustPolicyDoc: &trustpolicy.Document{Version: "1.0"}, // non-nil but has zero trust policies
+		TrustStore:     &mockTrustStore{},
+	}
+	if _, err := NewVerifier(opts); err == nil {
+		t.Fatal("expected error for invalid trust policy document, got nil")
+	}
+}
+
+func TestCRLFetcherCacheError(t *testing.T) {
+	// Point Notation's cache dir at a regular file so on-disk CRL cache creation
+	// fails, exercising the fetcher/options/constructor error paths.
+	oldCacheDir := dir.UserCacheDir
+	badDir := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(badDir, []byte("x"), 0o600); err != nil {
+		t.Fatalf("failed to create blocking file: %v", err)
+	}
+	dir.UserCacheDir = badDir
+	t.Cleanup(func() { dir.UserCacheDir = oldCacheDir })
+
+	t.Run("newFetcher returns cache error", func(t *testing.T) {
+		if _, err := newCRLHandler().newFetcher(&CRLOptions{CacheEnabled: true}); err == nil {
+			t.Fatal("expected CRL cache error, got nil")
+		}
+	})
+
+	t.Run("revocationValidators propagate fetcher error", func(t *testing.T) {
+		if _, _, err := newCRLHandler().revocationValidators(&CRLOptions{CacheEnabled: true}); err == nil {
+			t.Fatal("expected fetcher error, got nil")
+		}
+	})
+
+	t.Run("NewVerifier propagates fetcher error", func(t *testing.T) {
+		opts := &VerifierOptions{
+			Name:           testVerifierName,
+			TrustPolicyDoc: testTrustPolicyDocument(),
+			TrustStore:     &mockTrustStore{},
+			CRL:            &CRLOptions{CacheEnabled: true},
+		}
+		if _, err := NewVerifier(opts); err == nil {
+			t.Fatal("expected fetcher error, got nil")
+		}
+	})
+}
+
+func TestNewVerifierTypedNilTrustStore(t *testing.T) {
+	var typedNil *mockTrustStore // typed nil that still satisfies X509TrustStore
+	opts := &VerifierOptions{
+		Name:           testVerifierName,
+		TrustPolicyDoc: testTrustPolicyDocument(),
+		TrustStore:     typedNil,
+	}
+	if _, err := NewVerifier(opts); err == nil {
+		t.Fatal("expected error for typed-nil trust store, got nil")
+	}
+}
+
+func TestRevocationValidatorsErrorPaths(t *testing.T) {
+	t.Run("CRL fetcher creation error", func(t *testing.T) {
+		h := newCRLHandler()
+		h.newHTTPFetcher = func(*http.Client) (*corecrl.HTTPFetcher, error) {
+			return nil, errors.New("fetcher error")
+		}
+		if _, _, err := h.revocationValidators(&CRLOptions{}); err == nil {
+			t.Fatal("expected fetcher error, got nil")
+		}
+	})
+
+	t.Run("code signing validator creation error", func(t *testing.T) {
+		h := newCRLHandler()
+		h.newValidator = func(revocation.Options) (revocation.Validator, error) {
+			return nil, errors.New("validator error")
+		}
+		if _, _, err := h.revocationValidators(&CRLOptions{}); err == nil {
+			t.Fatal("expected code signing validator error, got nil")
+		}
+	})
+
+	t.Run("timestamping validator creation error", func(t *testing.T) {
+		h := newCRLHandler()
+		// Fail only on the second validator so the timestamping creation path
+		// surfaces the error.
+		var calls int
+		h.newValidator = func(revocation.Options) (revocation.Validator, error) {
+			calls++
+			if calls == 1 {
+				return mockRevocationValidator{}, nil
+			}
+			return nil, errors.New("validator error")
+		}
+		if _, _, err := h.revocationValidators(&CRLOptions{}); err == nil {
+			t.Fatal("expected timestamping validator error, got nil")
+		}
+	})
+
+	t.Run("CRL cache root resolution error", func(t *testing.T) {
+		h := newCRLHandler()
+		h.cacheRootPath = func() (string, error) {
+			return "", errors.New("cache root error")
+		}
+		if _, err := h.newFetcher(&CRLOptions{CacheEnabled: true}); err == nil {
+			t.Fatal("expected cache root error, got nil")
+		}
+	})
+}
+
+func testTrustPolicyDocument() *trustpolicy.Document {
+	return &trustpolicy.Document{
+		Version: "1.0",
+		TrustPolicies: []trustpolicy.TrustPolicy{
+			{
+				Name:           "default",
+				RegistryScopes: []string{"*"},
+				SignatureVerification: trustpolicy.SignatureVerification{
+					VerificationLevel: "strict",
+				},
+				TrustStores:       []string{"ca:cert"},
+				TrustedIdentities: []string{"*"},
+			},
+		},
 	}
 }
 

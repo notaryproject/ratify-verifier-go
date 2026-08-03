@@ -53,6 +53,11 @@ type VerifierOptions struct {
 	// https://github.com/notaryproject/notation-go/blob/v1.3.0/plugin/manager.go#L33
 	// Optional.
 	PluginManager plugin.Manager
+
+	// CRL configures certificate revocation list checks. Optional. When set,
+	// code signing and timestamping revocation validators are created using the
+	// configured CRL fetcher.
+	CRL *CRLOptions
 }
 
 // Verifier is a ratify.Verifier implementation that verifies Notation
@@ -64,15 +69,47 @@ type Verifier struct {
 
 // NewVerifier creates a new Notation verifier.
 func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
-	v, err := verifier.New(opts.TrustPolicyDoc, opts.TrustStore, opts.PluginManager)
+	if opts == nil {
+		return nil, fmt.Errorf("verifier options cannot be nil")
+	}
+	if opts.Name == "" {
+		return nil, fmt.Errorf("verifier name cannot be empty")
+	}
+	// TrustStore is an interface, so notation-go's untyped-nil check misses a
+	// typed-nil value, which would panic during verification; guard it here.
+	if isNil(opts.TrustStore) {
+		return nil, fmt.Errorf("trust store cannot be nil")
+	}
+
+	notationVerifier, err := opts.toNotationVerifier()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create notation verifier: %w", err)
+		return nil, err
 	}
 
 	return &Verifier{
 		name:     opts.Name,
-		verifier: v,
+		verifier: notationVerifier,
 	}, nil
+}
+
+// toNotationVerifier builds the underlying notation.Verifier from opts, wiring
+// CRL revocation validators when CRL checking is configured.
+func (opts *VerifierOptions) toNotationVerifier() (notation.Verifier, error) {
+	notationVerifierOpts := verifier.VerifierOptions{}
+	if opts.CRL != nil {
+		codeSigningValidator, timestampingValidator, err := newCRLHandler().revocationValidators(opts.CRL)
+		if err != nil {
+			return nil, err
+		}
+		notationVerifierOpts.RevocationCodeSigningValidator = codeSigningValidator
+		notationVerifierOpts.RevocationTimestampingValidator = timestampingValidator
+	}
+
+	v, err := verifier.NewWithOptions(opts.TrustPolicyDoc, opts.TrustStore, opts.PluginManager, notationVerifierOpts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create notation verifier: %w", err)
+	}
+	return v, nil
 }
 
 // Name returns the name of the verifier.
