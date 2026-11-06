@@ -19,6 +19,9 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -917,11 +920,39 @@ func createBundlePublicKeyMaterial(config *PublicKeyConfig) root.TrustedMaterial
 	})
 }
 
+// validatePublicKey returns an error if the public key is nil, including
+// typed-nil ECDSA and RSA keys and empty Ed25519 keys.
+func validatePublicKey(publicKey crypto.PublicKey) error {
+	switch key := publicKey.(type) {
+	case nil:
+		return errors.New("public key is nil")
+	case *ecdsa.PublicKey:
+		if key == nil {
+			return errors.New("invalid ECDSA public key: nil")
+		}
+	case *rsa.PublicKey:
+		if key == nil {
+			return errors.New("invalid RSA public key: nil")
+		}
+	case ed25519.PublicKey:
+		if len(key) == 0 {
+			return errors.New("invalid Ed25519 public key: empty")
+		}
+	}
+	return nil
+}
+
 // loadBundleKeyVerifier loads a signature verifier for the public key using
 // the default hash for the key type (ECDSA P-256: SHA256, P-384: SHA384,
 // P-521: SHA512, RSA: SHA256). If hashFunc is set and differs from the
 // default, signatures using hashFunc are accepted as well.
 func loadBundleKeyVerifier(publicKey crypto.PublicKey, hashFunc crypto.Hash) (signature.Verifier, error) {
+	// sigstore dereferences the key when selecting the default algorithm, so
+	// nil keys must be rejected to return an error instead of panicking.
+	if err := validatePublicKey(publicKey); err != nil {
+		return nil, err
+	}
+
 	var verifiers []signature.Verifier
 	var errs []error
 

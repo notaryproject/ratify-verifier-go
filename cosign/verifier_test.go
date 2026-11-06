@@ -19,8 +19,10 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -3429,6 +3431,21 @@ func TestCreateBundleKeyVerifiers_Errors(t *testing.T) {
 
 func TestLoadBundleKeyVerifier(t *testing.T) {
 	p256 := generateECDSAKey(t, elliptic.P256())
+
+	t.Run("nil keys", func(t *testing.T) {
+		for name, key := range map[string]crypto.PublicKey{
+			"nil":             nil,
+			"typed-nil ecdsa": (*ecdsa.PublicKey)(nil),
+			"typed-nil rsa":   (*rsa.PublicKey)(nil),
+			"empty ed25519":   ed25519.PublicKey(nil),
+		} {
+			for _, hash := range []crypto.Hash{0, crypto.SHA256} {
+				if _, err := loadBundleKeyVerifier(key, hash); err == nil {
+					t.Fatalf("%s with hash %v: expected error", name, hash)
+				}
+			}
+		}
+	})
 
 	t.Run("invalid key", func(t *testing.T) {
 		if _, err := loadBundleKeyVerifier("invalid-key", 0); err == nil {
