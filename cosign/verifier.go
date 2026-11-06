@@ -16,6 +16,7 @@ limitations under the License.
 package cosign
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"encoding/base64"
@@ -24,6 +25,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"time"
 
 	"github.com/notaryproject/ratify-go"
@@ -37,14 +40,52 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/tuf"
 	"github.com/sigstore/sigstore-go/pkg/verify"
 	"github.com/sigstore/sigstore/pkg/signature"
+	"google.golang.org/protobuf/encoding/protojson"
+)
+
+const (
+	// ArtifactTypeCosignSignature is the artifact type of legacy cosign
+	// signatures, which carry a simple signing layer plus signature
+	// annotations.
+	ArtifactTypeCosignSignature = "application/vnd.dev.cosign.artifact.sig.v1+json"
+
+	// ArtifactTypeSigstoreBundle is the artifact type of the OCI referrers
+	// produced by cosign v3 (new bundle format). The single layer of such a
+	// referrer is a protobuf-JSON encoded Sigstore bundle. Both cosign
+	// signatures and attestations use this artifact type; they are told apart
+	// by the in-toto predicate type.
+	ArtifactTypeSigstoreBundle = "application/vnd.dev.sigstore.bundle.v0.3+json"
+
+	// AnnotationKeyBundlePredicateType is the manifest annotation set by cosign
+	// v3 on Sigstore bundle referrers to advertise the in-toto predicate type
+	// of the bundled statement. The annotation is not signed and is only used
+	// as a pre-filter.
+	AnnotationKeyBundlePredicateType = "dev.sigstore.bundle.predicateType"
+
+	// PredicateTypeCosignSign is the in-toto predicate type used by
+	// `cosign sign` when producing Sigstore bundle signatures.
+	PredicateTypeCosignSign = "https://sigstore.dev/cosign/sign/v1"
 )
 
 const (
 	verifierTypeCosign = "cosign"
 
-	mediaTypeCosignArtifactSignature = "application/vnd.dev.cosign.artifact.sig.v1+json"
+	mediaTypeCosignArtifactSignature = ArtifactTypeCosignSignature
 	mediaTypeSigstoreBundle01        = "application/vnd.dev.sigstore.bundle+json;version=0.1"
 	mediaTypeSimpleSigning           = "application/vnd.dev.cosign.simplesigning.v1+json"
+
+	// mediaTypeSigstoreBundlePrefix is the media type prefix of Sigstore bundle
+	// layers, e.g. application/vnd.dev.sigstore.bundle.v0.3+json.
+	mediaTypeSigstoreBundlePrefix = "application/vnd.dev.sigstore.bundle"
+	payloadTypeInToto             = "application/vnd.in-toto+json"
+
+	// minBundleVersion is the minimum Sigstore bundle version accepted for
+	// cosign v3 bundle signatures.
+	minBundleVersion = "v0.3"
+
+	// maxBundleSize is the maximum size of a Sigstore bundle layer. Cosign
+	// bundles are typically a few kilobytes.
+	maxBundleSize = 4 * 1024 * 1024
 
 	annotationKeyBundle    = "dev.sigstore.cosign/bundle"
 	annotationKeyCert      = "dev.sigstore.cosign/certificate"
@@ -57,7 +98,13 @@ type PublicKeyConfig struct {
 	PublicKey crypto.PublicKey
 
 	// SignatureAlgorithm defines the algorithm used for signature verification.
-	// Optional. If not provided, defaults to SHA256.
+	// Optional. If not provided, defaults to SHA256 for legacy cosign
+	// signatures.
+	//
+	// For Sigstore bundle signatures (cosign v3), the default hash for the key
+	// type is always accepted (ECDSA P-256: SHA256, P-384: SHA384, P-521:
+	// SHA512, RSA: SHA256, Ed25519), matching how cosign signs with a key. If
+	// SignatureAlgorithm is set to a different hash, it is accepted as well.
 	SignatureAlgorithm crypto.Hash
 
 	// ValidityPeriodStart defines the start time for the public key validity
@@ -114,6 +161,11 @@ type Verifier struct {
 	ignoreTLog       bool
 	getPublicKeys    func(context.Context) ([]*PublicKeyConfig, error)
 	getVerifier      func() (*verify.Verifier, error)
+
+	// getBundleVerifiers returns the verifiers used for Sigstore bundle
+	// signatures. For key-based verification there is one verifier per
+	// configured public key. If nil, getVerifier is used.
+	getBundleVerifiers func() ([]*verify.Verifier, error)
 }
 
 // NewVerifier creates a new Cosign verifier.
@@ -126,9 +178,13 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 	}
 
 	var getVerifier func() (*verify.Verifier, error)
+	var getBundleVerifiers func() ([]*verify.Verifier, error)
 	if opts.GetPublicKeys != nil {
 		getVerifier = func() (*verify.Verifier, error) {
 			return createVerifier(opts)
+		}
+		getBundleVerifiers = func() ([]*verify.Verifier, error) {
+			return createBundleKeyVerifiers(opts)
 		}
 	} else {
 		v, err := createVerifier(opts)
@@ -138,14 +194,18 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 		getVerifier = func() (*verify.Verifier, error) {
 			return v, nil
 		}
+		getBundleVerifiers = func() ([]*verify.Verifier, error) {
+			return []*verify.Verifier{v}, nil
+		}
 	}
 
 	return &Verifier{
-		getVerifier:      getVerifier,
-		name:             opts.Name,
-		identityPolicies: opts.IdentityPolicies,
-		ignoreTLog:       opts.IgnoreTLog,
-		getPublicKeys:    opts.GetPublicKeys,
+		getVerifier:        getVerifier,
+		getBundleVerifiers: getBundleVerifiers,
+		name:               opts.Name,
+		identityPolicies:   opts.IdentityPolicies,
+		ignoreTLog:         opts.IgnoreTLog,
+		getPublicKeys:      opts.GetPublicKeys,
 	}, nil
 }
 
@@ -160,25 +220,81 @@ func createVerifier(opts *VerifierOptions) (*verify.Verifier, error) {
 	trustedMaterial = append(trustedMaterial, trustedPublicKeyMaterial...)
 
 	// Keyless verification: use provided trusted root or fetch from TUF
-	if opts.TrustedRoot != nil {
-		trustedMaterial = append(trustedMaterial, opts.TrustedRoot)
-	} else {
-		// Fetch default Sigstore trusted root
-		if opts.TUFOptions == nil {
-			opts.TUFOptions = tuf.DefaultOptions()
-		}
-		tufClient, err := tuf.New(opts.TUFOptions)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create TUF client: %w", err)
-		}
+	trustedRoot, err := getTrustedRoot(opts)
+	if err != nil {
+		return nil, err
+	}
+	trustedMaterial = append(trustedMaterial, trustedRoot)
 
-		trustedRoot, err := root.GetTrustedRoot(tufClient)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch trusted root: %w", err)
+	// Create the underlying cosign verifier
+	return verify.NewVerifier(trustedMaterial, getVerifierOptions(opts)...)
+}
+
+// createBundleKeyVerifiers creates one verifier per configured public key for
+// key-based verification of Sigstore bundle signatures. A dedicated verifier
+// per key is required because the public key material does not use key hints,
+// so a single collection would only ever try the first key.
+func createBundleKeyVerifiers(opts *VerifierOptions) ([]*verify.Verifier, error) {
+	publicKeys, err := opts.GetPublicKeys(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get public keys: %w", err)
+	}
+	if len(publicKeys) == 0 {
+		return nil, errors.New("no public keys configured")
+	}
+	for _, config := range publicKeys {
+		if config == nil {
+			return nil, fmt.Errorf("public key config cannot be nil")
 		}
-		trustedMaterial = append(trustedMaterial, trustedRoot)
 	}
 
+	trustedRoot, err := getTrustedRoot(opts)
+	if err != nil {
+		return nil, err
+	}
+	verifierOpts := getVerifierOptions(opts)
+
+	verifiers := make([]*verify.Verifier, 0, len(publicKeys))
+	for _, config := range publicKeys {
+		trustedMaterial := root.TrustedMaterialCollection{
+			createBundlePublicKeyMaterial(config),
+			trustedRoot,
+		}
+		v, err := verify.NewVerifier(trustedMaterial, verifierOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create verifier: %w", err)
+		}
+		verifiers = append(verifiers, v)
+	}
+	return verifiers, nil
+}
+
+// getTrustedRoot returns the configured trusted root, or fetches the default
+// Sigstore trusted root via TUF if none is configured.
+func getTrustedRoot(opts *VerifierOptions) (root.TrustedMaterial, error) {
+	if opts.TrustedRoot != nil {
+		return opts.TrustedRoot, nil
+	}
+
+	// Fetch default Sigstore trusted root
+	if opts.TUFOptions == nil {
+		opts.TUFOptions = tuf.DefaultOptions()
+	}
+	tufClient, err := tuf.New(opts.TUFOptions)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create TUF client: %w", err)
+	}
+
+	trustedRoot, err := root.GetTrustedRoot(tufClient)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch trusted root: %w", err)
+	}
+	return trustedRoot, nil
+}
+
+// getVerifierOptions returns the sigstore-go verifier options derived from the
+// verifier options.
+func getVerifierOptions(opts *VerifierOptions) []verify.VerifierOption {
 	// Create verifier options for signature verification
 	var verifierOpts []verify.VerifierOption
 
@@ -202,8 +318,7 @@ func createVerifier(opts *VerifierOptions) (*verify.Verifier, error) {
 		verifierOpts = append(verifierOpts, verify.WithSignedCertificateTimestamps(1))
 	}
 
-	// Create the underlying cosign verifier
-	return verify.NewVerifier(trustedMaterial, verifierOpts...)
+	return verifierOpts
 }
 
 func createTrustedMaterialFromPublicKeys(ctx context.Context, getPublicKeys func(context.Context) ([]*PublicKeyConfig, error)) ([]root.TrustedMaterial, error) {
@@ -221,11 +336,13 @@ func createTrustedMaterialFromPublicKeys(ctx context.Context, getPublicKeys func
 		if config == nil {
 			return nil, fmt.Errorf("public key config cannot be nil")
 		}
-		if config.SignatureAlgorithm == 0 {
+		// Copy the config so that the caller-owned config is not mutated.
+		legacyConfig := *config
+		if legacyConfig.SignatureAlgorithm == 0 {
 			// Default to SHA256 if no algorithm is specified
-			config.SignatureAlgorithm = crypto.SHA256
+			legacyConfig.SignatureAlgorithm = crypto.SHA256
 		}
-		trustedMaterial = append(trustedMaterial, createTrustedPublicKeyMaterial(config))
+		trustedMaterial = append(trustedMaterial, createTrustedPublicKeyMaterial(&legacyConfig))
 	}
 	return trustedMaterial, nil
 }
@@ -240,10 +357,41 @@ func (v *Verifier) Type() string {
 	return verifierTypeCosign
 }
 
-// Verifiable returns true if the artifact is a Cosign signature.
+// Verifiable returns true if the artifact is a Cosign signature, either a
+// legacy cosign signature or a cosign v3 Sigstore bundle signature.
 func (v *Verifier) Verifiable(artifact ocispec.Descriptor) bool {
-	return artifact.ArtifactType == mediaTypeCosignArtifactSignature &&
-		artifact.MediaType == ocispec.MediaTypeImageManifest
+	return IsVerifiable(artifact)
+}
+
+// IsVerifiable returns true if the artifact is a Cosign signature that can be
+// verified by a Cosign [Verifier]:
+//   - a legacy cosign signature with artifact type
+//     [ArtifactTypeCosignSignature], or
+//   - a cosign v3 Sigstore bundle with artifact type
+//     [ArtifactTypeSigstoreBundle], unless its
+//     [AnnotationKeyBundlePredicateType] annotation advertises a predicate type
+//     other than [PredicateTypeCosignSign]. Such bundles are attestations (e.g.
+//     SLSA provenance or SBOMs) rather than signatures and are skipped so that
+//     no verification report is produced for them. Bundles without the
+//     annotation are treated as verifiable; the signed predicate type is always
+//     checked during verification.
+//
+// In both cases, the artifact must be an OCI image manifest.
+func IsVerifiable(artifact ocispec.Descriptor) bool {
+	if artifact.MediaType != ocispec.MediaTypeImageManifest {
+		return false
+	}
+	switch artifact.ArtifactType {
+	case ArtifactTypeCosignSignature:
+		return true
+	case ArtifactTypeSigstoreBundle:
+		if predicateType, ok := artifact.Annotations[AnnotationKeyBundlePredicateType]; ok {
+			return predicateType == PredicateTypeCosignSign
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 // Verify verifies the artifact containing Cosign signatures.
@@ -257,6 +405,10 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 	var sigManifest ocispec.Manifest
 	if err := json.Unmarshal(sigManifestBytes, &sigManifest); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal signature manifest: %w", err)
+	}
+
+	if opts.ArtifactDescriptor.ArtifactType == ArtifactTypeSigstoreBundle || sigManifest.ArtifactType == ArtifactTypeSigstoreBundle {
+		return v.verifyBundleSignatures(ctx, opts, &sigManifest)
 	}
 
 	// Get signature descriptors of simple signing layers
@@ -283,6 +435,12 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 		reports = append(reports, report)
 	}
 
+	return newVerificationResult(v, reports, validSigFound), nil
+}
+
+// newVerificationResult builds the verification result from the per-layer
+// reports.
+func newVerificationResult(v *Verifier, reports []*layerReport, validSigFound bool) *ratify.VerificationResult {
 	result := &ratify.VerificationResult{
 		Verifier: v,
 		Detail: map[string][]*layerReport{
@@ -295,7 +453,167 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 		result.Description = "Cosign signature verification failed: no valid signatures found"
 		result.Err = errors.New("no valid signatures found, see result for details")
 	}
-	return result, nil
+	return result
+}
+
+// verifyBundleSignatures verifies a cosign v3 signature stored as a Sigstore
+// bundle in the layer of an OCI referrer manifest.
+func (v *Verifier) verifyBundleSignatures(ctx context.Context, opts *ratify.VerifyOptions, sigManifest *ocispec.Manifest) (*ratify.VerificationResult, error) {
+	if sigManifest.MediaType != ocispec.MediaTypeImageManifest {
+		return nil, fmt.Errorf("expected media type %s, got %s", ocispec.MediaTypeImageManifest, sigManifest.MediaType)
+	}
+
+	var layers []ocispec.Descriptor
+	for _, layer := range sigManifest.Layers {
+		if strings.HasPrefix(layer.MediaType, mediaTypeSigstoreBundlePrefix) {
+			layers = append(layers, layer)
+		}
+	}
+	if len(layers) == 0 {
+		return nil, errors.New("no Sigstore bundle layer found in signature manifest")
+	}
+
+	validSigFound := false
+	var reports []*layerReport
+	for _, layer := range layers {
+		report := &layerReport{
+			Digest: layer.Digest.String(),
+		}
+		if res, err := v.verifyBundleLayer(ctx, opts, layer); err != nil {
+			report.Error = err
+			report.Succeeded = false
+		} else {
+			validSigFound = true
+			report.Succeeded = true
+			report.VerificationResult = res
+		}
+		reports = append(reports, report)
+	}
+
+	return newVerificationResult(v, reports, validSigFound), nil
+}
+
+// verifyBundleLayer fetches, parses and verifies a single Sigstore bundle
+// layer against the subject.
+func (v *Verifier) verifyBundleLayer(ctx context.Context, opts *ratify.VerifyOptions, layer ocispec.Descriptor) (*verify.VerificationResult, error) {
+	if layer.Size > maxBundleSize {
+		return nil, fmt.Errorf("bundle size %d exceeds the limit of %d bytes", layer.Size, maxBundleSize)
+	}
+	bundleBytes, err := opts.Store.FetchBlob(ctx, opts.Repository, layer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch bundle: %w", err)
+	}
+	if len(bundleBytes) > maxBundleSize {
+		return nil, fmt.Errorf("bundle size %d exceeds the limit of %d bytes", len(bundleBytes), maxBundleSize)
+	}
+
+	bun, err := parseBundle(bundleBytes)
+	if err != nil {
+		return nil, err
+	}
+	return v.verifySigstoreBundle(bun, opts.SubjectDescriptor.Digest)
+}
+
+// parseBundle parses a protobuf-JSON encoded Sigstore bundle and checks that it
+// is a cosign v3 style bundle, i.e. a bundle of version v0.3 or later carrying
+// a DSSE envelope with an in-toto statement.
+func parseBundle(bundleBytes []byte) (*bundle.Bundle, error) {
+	var pb protobundle.Bundle
+	if err := protojson.Unmarshal(bundleBytes, &pb); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal bundle: %w", err)
+	}
+	bun, err := bundle.NewBundle(&pb)
+	if err != nil {
+		return nil, fmt.Errorf("invalid bundle: %w", err)
+	}
+	if !bun.MinVersion(minBundleVersion) {
+		return nil, fmt.Errorf("unsupported bundle media type %q: bundle version must be %s or later", pb.GetMediaType(), minBundleVersion)
+	}
+	envelope := pb.GetDsseEnvelope()
+	if envelope == nil {
+		return nil, errors.New("bundle content is not a DSSE envelope")
+	}
+	if envelope.GetPayloadType() != payloadTypeInToto {
+		return nil, fmt.Errorf("unsupported DSSE payload type %q: expected %q", envelope.GetPayloadType(), payloadTypeInToto)
+	}
+	return bun, nil
+}
+
+// verifySigstoreBundle verifies a cosign v3 Sigstore bundle against the subject
+// digest and ensures that the signed statement is a cosign signature.
+func (v *Verifier) verifySigstoreBundle(bun *bundle.Bundle, subject digest.Digest) (*verify.VerificationResult, error) {
+	artifactPolicy, err := getArtifactDigestPolicy(subject)
+	if err != nil {
+		return nil, err
+	}
+
+	if v.getPublicKeys != nil && bun.GetVerificationMaterial().GetPublicKey() == nil {
+		return nil, errors.New("key-based verification requires a bundle signed with a public key")
+	}
+
+	verifiers, err := v.bundleVerifiers()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get verifier: %w", err)
+	}
+
+	policy := verify.NewPolicy(artifactPolicy, v.identityPolicies...)
+	var errs []error
+	for _, verifier := range verifiers {
+		res, err := verifier.Verify(bun, policy)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if err := checkCosignSignStatement(res); err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
+	return nil, errors.Join(errs...)
+}
+
+// bundleVerifiers returns the verifiers used for Sigstore bundles.
+func (v *Verifier) bundleVerifiers() ([]*verify.Verifier, error) {
+	if v.getBundleVerifiers != nil {
+		return v.getBundleVerifiers()
+	}
+	verifier, err := v.getVerifier()
+	if err != nil {
+		return nil, err
+	}
+	return []*verify.Verifier{verifier}, nil
+}
+
+// getArtifactDigestPolicy returns the artifact policy binding the in-toto
+// statement subject to the subject digest.
+func getArtifactDigestPolicy(subject digest.Digest) (verify.ArtifactPolicyOption, error) {
+	if err := subject.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid subject digest %q: %w", subject, err)
+	}
+	alg := subject.Algorithm()
+	switch alg {
+	case digest.SHA256, digest.SHA512:
+	default:
+		return nil, fmt.Errorf("unsupported subject digest algorithm: %s", alg)
+	}
+	digestBytes, err := hex.DecodeString(subject.Encoded())
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode subject digest: %w", err)
+	}
+	return verify.WithArtifactDigest(string(alg), digestBytes), nil
+}
+
+// checkCosignSignStatement ensures that the verified in-toto statement is a
+// cosign signature. The predicate type annotation on the referrer manifest is
+// not signed, so an attestation could otherwise be presented as a signature.
+func checkCosignSignStatement(res *verify.VerificationResult) error {
+	if res == nil || res.Statement == nil {
+		return errors.New("bundle does not contain an in-toto statement")
+	}
+	if predicateType := res.Statement.GetPredicateType(); predicateType != PredicateTypeCosignSign {
+		return fmt.Errorf("bundle is not a cosign signature: predicateType %q", predicateType)
+	}
+	return nil
 }
 
 // verifySignatureLayer verifies a single simple signing layer.
@@ -583,6 +901,102 @@ func createTrustedPublicKeyMaterial(config *PublicKeyConfig) root.TrustedMateria
 		}
 		return root.NewExpiringKey(verifier, config.ValidityPeriodStart, config.ValidityPeriodEnd), nil
 	})
+}
+
+// createBundlePublicKeyMaterial creates a trusted material from a public key
+// for verifying Sigstore bundle signatures. Unlike legacy cosign signatures,
+// which always sign a SHA256 digest, DSSE signatures are computed with the
+// default hash of the signing key, so the key-specific default hash is used.
+func createBundlePublicKeyMaterial(config *PublicKeyConfig) root.TrustedMaterial {
+	return root.NewTrustedPublicKeyMaterial(func(string) (root.TimeConstrainedVerifier, error) {
+		verifier, err := loadBundleKeyVerifier(config.PublicKey, config.SignatureAlgorithm)
+		if err != nil {
+			return nil, err
+		}
+		return root.NewExpiringKey(verifier, config.ValidityPeriodStart, config.ValidityPeriodEnd), nil
+	})
+}
+
+// loadBundleKeyVerifier loads a signature verifier for the public key using
+// the default hash for the key type (ECDSA P-256: SHA256, P-384: SHA384,
+// P-521: SHA512, RSA: SHA256). If hashFunc is set and differs from the
+// default, signatures using hashFunc are accepted as well.
+func loadBundleKeyVerifier(publicKey crypto.PublicKey, hashFunc crypto.Hash) (signature.Verifier, error) {
+	var verifiers []signature.Verifier
+	var errs []error
+
+	defaultVerifier, err := signature.LoadDefaultVerifier(publicKey)
+	if err != nil {
+		errs = append(errs, err)
+	} else {
+		verifiers = append(verifiers, defaultVerifier)
+	}
+
+	if hashFunc != 0 {
+		useConfigured := defaultVerifier == nil
+		if !useConfigured {
+			details, err := signature.GetDefaultAlgorithmDetails(publicKey)
+			useConfigured = err != nil || details.GetHashType() != hashFunc
+		}
+		if useConfigured {
+			configuredVerifier, err := signature.LoadVerifier(publicKey, hashFunc)
+			if err != nil {
+				errs = append(errs, err)
+			} else {
+				verifiers = append(verifiers, configuredVerifier)
+			}
+		}
+	}
+
+	switch len(verifiers) {
+	case 0:
+		return nil, fmt.Errorf("failed to load verifier for public key: %w", errors.Join(errs...))
+	case 1:
+		return verifiers[0], nil
+	default:
+		return &multiHashVerifier{verifiers: verifiers}, nil
+	}
+}
+
+// multiHashVerifier verifies signatures created by the same public key with
+// one of several hash functions.
+type multiHashVerifier struct {
+	verifiers []signature.Verifier
+}
+
+// PublicKey returns the public key of the verifier.
+func (m *multiHashVerifier) PublicKey(opts ...signature.PublicKeyOption) (crypto.PublicKey, error) {
+	return m.verifiers[0].PublicKey(opts...)
+}
+
+// VerifySignature succeeds if any of the underlying verifiers verifies the
+// signature.
+func (m *multiHashVerifier) VerifySignature(sig, message io.Reader, opts ...signature.VerifyOption) error {
+	sigBytes, err := io.ReadAll(sig)
+	if err != nil {
+		return fmt.Errorf("failed to read signature: %w", err)
+	}
+	var messageBytes []byte
+	if message != nil {
+		messageBytes, err = io.ReadAll(message)
+		if err != nil {
+			return fmt.Errorf("failed to read message: %w", err)
+		}
+	}
+
+	var errs []error
+	for _, verifier := range m.verifiers {
+		var messageReader io.Reader
+		if message != nil {
+			messageReader = bytes.NewReader(messageBytes)
+		}
+		err := verifier.VerifySignature(bytes.NewReader(sigBytes), messageReader, opts...)
+		if err == nil {
+			return nil
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // layerReport is a report generated for a single simple signing
