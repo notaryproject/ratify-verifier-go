@@ -36,6 +36,7 @@ header:
     - '**/go.mod'
     - '**/go.sum'
     - '**/testdata/**'
+    - '**/schemas/**'
 
   comment: on-failure
 
