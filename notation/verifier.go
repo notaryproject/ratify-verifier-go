@@ -152,6 +152,15 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 		return result, nil
 	}
 
+	// A trust policy whose verification level is "skip" makes notation-go
+	// return an outcome with no envelope content and no error, so there is no
+	// certificate chain to report. notation-go guards the same field in
+	// VerificationOutcome.UserMetadata.
+	if outcome.EnvelopeContent == nil {
+		result.Description = "Notation signature verification skipped by the trust policy"
+		return result, nil
+	}
+
 	cert := outcome.EnvelopeContent.SignerInfo.CertificateChain[0]
 	result.Detail = map[string]string{
 		"Issuer": cert.Issuer.String(),

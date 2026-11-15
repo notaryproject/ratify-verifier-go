@@ -570,3 +570,58 @@ func TestVerify(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifySkipVerificationLevel(t *testing.T) {
+	// A trust policy may legitimately set the verification level to "skip",
+	// in which case notation-go returns an outcome with no envelope content
+	// and no error.
+	v, err := NewVerifier(&VerifierOptions{
+		Name: testVerifierName,
+		TrustPolicyDoc: &trustpolicy.Document{
+			Version: "1.0",
+			TrustPolicies: []trustpolicy.TrustPolicy{
+				{
+					Name:           "skip-verification",
+					RegistryScopes: []string{"*"},
+					SignatureVerification: trustpolicy.SignatureVerification{
+						VerificationLevel: "skip",
+					},
+				},
+			},
+		},
+		TrustStore: &mockTrustStore{},
+	})
+	if err != nil {
+		t.Fatalf("failed to create verifier: %v", err)
+	}
+
+	opts := &ratify.VerifyOptions{
+		Repository:         testRepo,
+		SubjectDescriptor:  ocispec.Descriptor{Digest: testDigest1},
+		ArtifactDescriptor: notationSignatureArtifact,
+		Store: &mockStore{
+			manifest: &ocispec.Manifest{
+				Layers: []ocispec.Descriptor{
+					{
+						Digest: testDigest2,
+					},
+				},
+			},
+			signatureBlob: []byte("not-a-signature-envelope"),
+		},
+	}
+
+	result, err := v.Verify(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil {
+		t.Fatal("expected a verification result, got nil")
+	}
+	if result.Err != nil {
+		t.Fatalf("expected no verification error, got: %v", result.Err)
+	}
+	if result.Description == "" {
+		t.Fatal("expected a description on the verification result")
+	}
+}
