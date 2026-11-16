@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/notaryproject/notation-core-go v1.3.0
 	github.com/notaryproject/notation-go v1.3.2
-	github.com/notaryproject/ratify-go v0.0.0-20250818061551-d370d67b849c
+	github.com/notaryproject/ratify-go v0.1.0
 	github.com/opencontainers/image-spec v1.1.1
 )
 
@@ -23,6 +23,6 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/mod v0.24.0 // indirect
-	golang.org/x/sync v0.14.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
 	oras.land/oras-go/v2 v2.6.0 // indirect
 )
