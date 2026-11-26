@@ -54,6 +54,12 @@ type VerifierOptions struct {
 	// Optional.
 	PluginManager plugin.Manager
 
+	// PluginConfig is passed to Notation verification plugins on every
+	// verification, the same as `notation verify --plugin-config key=value`.
+	// For example, the AWS Signer plugin reads `aws-region` from it.
+	// Optional.
+	PluginConfig map[string]string
+
 	// CRL configures the CRL fetcher used for revocation checks. Optional.
 	// Revocation is checked regardless: notation-go tries OCSP first and falls
 	// back to CRL. When nil, notation-go's default uncached CRL fetcher is used.
@@ -63,8 +69,9 @@ type VerifierOptions struct {
 // Verifier is a ratify.Verifier implementation that verifies Notation
 // signatures.
 type Verifier struct {
-	name     string
-	verifier notation.Verifier
+	name         string
+	verifier     notation.Verifier
+	pluginConfig map[string]string
 }
 
 // NewVerifier creates a new Notation verifier.
@@ -87,8 +94,9 @@ func NewVerifier(opts *VerifierOptions) (*Verifier, error) {
 	}
 
 	return &Verifier{
-		name:     opts.Name,
-		verifier: notationVerifier,
+		name:         opts.Name,
+		verifier:     notationVerifier,
+		pluginConfig: opts.PluginConfig,
 	}, nil
 }
 
@@ -145,6 +153,7 @@ func (v *Verifier) Verify(ctx context.Context, opts *ratify.VerifyOptions) (*rat
 	verifyOpts := notation.VerifierVerifyOptions{
 		SignatureMediaType: signatureDesc.MediaType,
 		ArtifactReference:  opts.Repository + "@" + opts.SubjectDescriptor.Digest.String(),
+		PluginConfig:       v.pluginConfig,
 	}
 	outcome, err := v.verifier.Verify(ctx, opts.SubjectDescriptor, signatureBlob, verifyOpts)
 	if err != nil {

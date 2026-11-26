@@ -26,3 +26,5 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	oras.land/oras-go/v2 v2.6.2 // indirect
 )
+
+replace github.com/notaryproject/ratify-go => github.com/fseldow/ratify-go v0.0.0-20261126062314-bbcf8da47993

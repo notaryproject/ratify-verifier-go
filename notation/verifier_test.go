@@ -104,9 +104,11 @@ func (m *mockStore) Resolve(_ context.Context, _ string) (ocispec.Descriptor, er
 // mockVerifier is a mock implementation of notation.Verifier.
 type mockVerifier struct {
 	verifySucceeded bool
+	lastVerifyOpts  notation.VerifierVerifyOptions
 }
 
-func (m *mockVerifier) Verify(_ context.Context, _ ocispec.Descriptor, _ []byte, _ notation.VerifierVerifyOptions) (*notation.VerificationOutcome, error) {
+func (m *mockVerifier) Verify(_ context.Context, _ ocispec.Descriptor, _ []byte, opts notation.VerifierVerifyOptions) (*notation.VerificationOutcome, error) {
+	m.lastVerifyOpts = opts
 	if m.verifySucceeded {
 		return &notation.VerificationOutcome{
 			EnvelopeContent: &signature.EnvelopeContent{

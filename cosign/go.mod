@@ -9,6 +9,7 @@ require (
 	github.com/sigstore/protobuf-specs v0.5.1
 	github.com/sigstore/sigstore v1.10.8
 	github.com/sigstore/sigstore-go v1.2.0
+	oras.land/oras-go/v2 v2.6.2
 )
 
 require (
@@ -78,5 +79,6 @@ require (
 	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
-	oras.land/oras-go/v2 v2.6.2 // indirect
 )
+
+replace github.com/notaryproject/ratify-go => github.com/fseldow/ratify-go v0.0.0-20261126062314-bbcf8da47993
