@@ -104,9 +104,11 @@ func (m *mockStore) Resolve(_ context.Context, _ string) (ocispec.Descriptor, er
 // mockVerifier is a mock implementation of notation.Verifier.
 type mockVerifier struct {
 	verifySucceeded bool
+	lastVerifyOpts  notation.VerifierVerifyOptions
 }
 
-func (m *mockVerifier) Verify(_ context.Context, _ ocispec.Descriptor, _ []byte, _ notation.VerifierVerifyOptions) (*notation.VerificationOutcome, error) {
+func (m *mockVerifier) Verify(_ context.Context, _ ocispec.Descriptor, _ []byte, opts notation.VerifierVerifyOptions) (*notation.VerificationOutcome, error) {
+	m.lastVerifyOpts = opts
 	if m.verifySucceeded {
 		return &notation.VerificationOutcome{
 			EnvelopeContent: &signature.EnvelopeContent{
@@ -568,5 +570,47 @@ func TestVerify(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestVerifyPassesPluginConfig(t *testing.T) {
+	mock := &mockVerifier{verifySucceeded: true}
+	pluginConfig := map[string]string{"aws-region": "us-east-1"}
+	verifier := &Verifier{
+		name:         testVerifierName,
+		verifier:     mock,
+		pluginConfig: pluginConfig,
+	}
+
+	_, err := verifier.Verify(context.Background(), &ratify.VerifyOptions{
+		Repository: testRepo,
+		Store: &mockStore{
+			manifest: &ocispec.Manifest{
+				Layers: []ocispec.Descriptor{{Digest: testDigest2}},
+			},
+			signatureBlob: []byte{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := mock.lastVerifyOpts.PluginConfig["aws-region"]; got != "us-east-1" {
+		t.Fatalf("expected plugin config aws-region=us-east-1, got %q (opts=%v)", got, mock.lastVerifyOpts.PluginConfig)
+	}
+}
+
+func TestNewVerifierStoresPluginConfig(t *testing.T) {
+	opts := &VerifierOptions{
+		Name:           testVerifierName,
+		TrustPolicyDoc: testTrustPolicyDocument(),
+		TrustStore:     &mockTrustStore{},
+		PluginConfig:   map[string]string{"aws-region": "us-west-2"},
+	}
+	verifier, err := NewVerifier(opts)
+	if err != nil {
+		t.Fatalf("failed to create verifier: %v", err)
+	}
+	if verifier.pluginConfig["aws-region"] != "us-west-2" {
+		t.Fatalf("expected plugin config to be stored on the verifier, got %v", verifier.pluginConfig)
 	}
 }
