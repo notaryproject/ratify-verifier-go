@@ -19,8 +19,10 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -38,10 +40,16 @@ import (
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
 	protocommon "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
+	protodsse "github.com/sigstore/protobuf-specs/gen/pb-go/dsse"
+	protorekor "github.com/sigstore/protobuf-specs/gen/pb-go/rekor/v1"
 	"github.com/sigstore/sigstore-go/pkg/root"
+	"github.com/sigstore/sigstore-go/pkg/testing/ca"
 	"github.com/sigstore/sigstore-go/pkg/tuf"
 	"github.com/sigstore/sigstore-go/pkg/verify"
+	"github.com/sigstore/sigstore/pkg/signature"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // Mock store for testing
@@ -296,6 +304,63 @@ func TestVerifier_Verifiable(t *testing.T) {
 			},
 			expected: false,
 		},
+		{
+			name: "sigstore bundle without predicate type annotation",
+			descriptor: ocispec.Descriptor{
+				ArtifactType: ArtifactTypeSigstoreBundle,
+				MediaType:    ocispec.MediaTypeImageManifest,
+			},
+			expected: true,
+		},
+		{
+			name: "sigstore bundle with cosign sign predicate type",
+			descriptor: ocispec.Descriptor{
+				ArtifactType: ArtifactTypeSigstoreBundle,
+				MediaType:    ocispec.MediaTypeImageManifest,
+				Annotations: map[string]string{
+					AnnotationKeyBundlePredicateType: PredicateTypeCosignSign,
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "sigstore bundle with SLSA provenance predicate type",
+			descriptor: ocispec.Descriptor{
+				ArtifactType: ArtifactTypeSigstoreBundle,
+				MediaType:    ocispec.MediaTypeImageManifest,
+				Annotations: map[string]string{
+					AnnotationKeyBundlePredicateType: "https://slsa.dev/provenance/v1",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "sigstore bundle with empty predicate type",
+			descriptor: ocispec.Descriptor{
+				ArtifactType: ArtifactTypeSigstoreBundle,
+				MediaType:    ocispec.MediaTypeImageManifest,
+				Annotations: map[string]string{
+					AnnotationKeyBundlePredicateType: "",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "sigstore bundle with invalid media type",
+			descriptor: ocispec.Descriptor{
+				ArtifactType: ArtifactTypeSigstoreBundle,
+				MediaType:    ocispec.MediaTypeImageIndex,
+			},
+			expected: false,
+		},
+		{
+			name: "older sigstore bundle artifact type",
+			descriptor: ocispec.Descriptor{
+				ArtifactType: "application/vnd.dev.sigstore.bundle+json;version=0.1",
+				MediaType:    ocispec.MediaTypeImageManifest,
+			},
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -303,6 +368,9 @@ func TestVerifier_Verifiable(t *testing.T) {
 			result := verifier.Verifiable(tt.descriptor)
 			if result != tt.expected {
 				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+			if got := IsVerifiable(tt.descriptor); got != tt.expected {
+				t.Errorf("IsVerifiable: expected %v, got %v", tt.expected, got)
 			}
 		})
 	}
@@ -2512,5 +2580,969 @@ func TestVerifier_IgnoreCTLog(t *testing.T) {
 				t.Fatalf("expected verification to succeed with ignoreCTLog=%v, got error: %v", tt.ignoreCTLog, result.Err)
 			}
 		})
+	}
+}
+
+const (
+	testBundleRepo            = "registry.example.com/test/repo"
+	testBundleIdentity        = "signer@example.com"
+	testBundleIssuer          = "https://issuer.example.com"
+	testPredicateTypeSLSA     = "https://slsa.dev/provenance/v1"
+	mediaTypeSigstoreBundle03 = "application/vnd.dev.sigstore.bundle.v0.3+json"
+)
+
+// newInTotoStatement returns an in-toto v1 statement about the subject digest.
+func newInTotoStatement(t *testing.T, predicateType string, subject digest.Digest) []byte {
+	t.Helper()
+	statement := map[string]any{
+		"_type": "https://in-toto.io/Statement/v1",
+		"subject": []map[string]any{
+			{
+				"name": testBundleRepo,
+				"digest": map[string]string{
+					string(subject.Algorithm()): subject.Encoded(),
+				},
+			},
+		},
+		"predicateType": predicateType,
+		"predicate":     map[string]any{},
+	}
+	b, err := json.Marshal(statement)
+	if err != nil {
+		t.Fatalf("failed to marshal statement: %v", err)
+	}
+	return b
+}
+
+// generateECDSAKey generates an ECDSA key on the given curve.
+func generateECDSAKey(t *testing.T, curve elliptic.Curve) *ecdsa.PrivateKey {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+	return priv
+}
+
+// defaultHashForCurve returns the hash cosign uses when signing with a key on
+// the given curve.
+func defaultHashForCurve(curve elliptic.Curve) crypto.Hash {
+	switch curve {
+	case elliptic.P384():
+		return crypto.SHA384
+	case elliptic.P521():
+		return crypto.SHA512
+	default:
+		return crypto.SHA256
+	}
+}
+
+// signDSSE signs the DSSE pre-authentication encoding of the payload.
+func signDSSE(t *testing.T, priv *ecdsa.PrivateKey, hash crypto.Hash, payloadType string, payload []byte) []byte {
+	t.Helper()
+	pae := fmt.Sprintf("DSSEv1 %d %s %d %s", len(payloadType), payloadType, len(payload), payload)
+	h := hash.New()
+	h.Write([]byte(pae))
+	sig, err := ecdsa.SignASN1(rand.Reader, priv, h.Sum(nil))
+	if err != nil {
+		t.Fatalf("failed to sign DSSE payload: %v", err)
+	}
+	return sig
+}
+
+// newKeyDSSEBundle builds a v0.3 Sigstore bundle with a DSSE envelope signed
+// by the given key, without transparency log entries or timestamps, mirroring
+// `cosign sign --key ... --tlog-upload=false`.
+func newKeyDSSEBundle(t *testing.T, priv *ecdsa.PrivateKey, hash crypto.Hash, payloadType string, payload []byte) *protobundle.Bundle {
+	t.Helper()
+	return &protobundle.Bundle{
+		MediaType: mediaTypeSigstoreBundle03,
+		VerificationMaterial: &protobundle.VerificationMaterial{
+			Content: &protobundle.VerificationMaterial_PublicKey{
+				PublicKey: &protocommon.PublicKeyIdentifier{},
+			},
+		},
+		Content: &protobundle.Bundle_DsseEnvelope{
+			DsseEnvelope: &protodsse.Envelope{
+				Payload:     payload,
+				PayloadType: payloadType,
+				Signatures: []*protodsse.Signature{
+					{Sig: signDSSE(t, priv, hash, payloadType, payload)},
+				},
+			},
+		},
+	}
+}
+
+// newKeylessDSSEBundle builds a v0.3 Sigstore bundle signed by a Fulcio-style
+// certificate issued by the virtual Sigstore, including a Rekor entry with an
+// inclusion proof and an RFC3161 timestamp.
+func newKeylessDSSEBundle(t *testing.T, vs *ca.VirtualSigstore, identity, issuer string, statement []byte) *protobundle.Bundle {
+	t.Helper()
+	entity, err := vs.AttestAtTime(identity, issuer, statement, time.Now().Add(5*time.Minute), true)
+	if err != nil {
+		t.Fatalf("failed to attest: %v", err)
+	}
+	verificationContent, err := entity.VerificationContent()
+	if err != nil {
+		t.Fatalf("failed to get verification content: %v", err)
+	}
+	signatureContent, err := entity.SignatureContent()
+	if err != nil {
+		t.Fatalf("failed to get signature content: %v", err)
+	}
+	envelope := signatureContent.EnvelopeContent().RawEnvelope()
+	payload, err := base64.StdEncoding.DecodeString(envelope.Payload)
+	if err != nil {
+		t.Fatalf("failed to decode payload: %v", err)
+	}
+	sig, err := base64.StdEncoding.DecodeString(envelope.Signatures[0].Sig)
+	if err != nil {
+		t.Fatalf("failed to decode signature: %v", err)
+	}
+	timestamps, err := entity.Timestamps()
+	if err != nil {
+		t.Fatalf("failed to get timestamps: %v", err)
+	}
+	var rfc3161Timestamps []*protocommon.RFC3161SignedTimestamp
+	for _, ts := range timestamps {
+		rfc3161Timestamps = append(rfc3161Timestamps, &protocommon.RFC3161SignedTimestamp{SignedTimestamp: ts})
+	}
+	entries, err := entity.TlogEntries()
+	if err != nil {
+		t.Fatalf("failed to get tlog entries: %v", err)
+	}
+	var tlogEntries []*protorekor.TransparencyLogEntry
+	for _, entry := range entries {
+		tle := entry.TransparencyLogEntry()
+		tle.KindVersion = &protorekor.KindVersion{Kind: "dsse", Version: "0.0.1"}
+		tlogEntries = append(tlogEntries, tle)
+	}
+
+	return &protobundle.Bundle{
+		MediaType: mediaTypeSigstoreBundle03,
+		VerificationMaterial: &protobundle.VerificationMaterial{
+			Content: &protobundle.VerificationMaterial_Certificate{
+				Certificate: &protocommon.X509Certificate{
+					RawBytes: verificationContent.Certificate().Raw,
+				},
+			},
+			TlogEntries: tlogEntries,
+			TimestampVerificationData: &protobundle.TimestampVerificationData{
+				Rfc3161Timestamps: rfc3161Timestamps,
+			},
+		},
+		Content: &protobundle.Bundle_DsseEnvelope{
+			DsseEnvelope: &protodsse.Envelope{
+				Payload:     payload,
+				PayloadType: envelope.PayloadType,
+				Signatures:  []*protodsse.Signature{{Sig: sig}},
+			},
+		},
+	}
+}
+
+// marshalTestBundle encodes the bundle as protobuf JSON, as stored by cosign.
+func marshalTestBundle(t *testing.T, pb *protobundle.Bundle) []byte {
+	t.Helper()
+	b, err := protojson.Marshal(pb)
+	if err != nil {
+		t.Fatalf("failed to marshal bundle: %v", err)
+	}
+	return b
+}
+
+// newBundleVerifyOptions stores a cosign v3 bundle referrer for the subject in
+// a mock store and returns the corresponding verify options.
+func newBundleVerifyOptions(t *testing.T, bundleBytes []byte, subject digest.Digest, annotations map[string]string) *ratify.VerifyOptions {
+	t.Helper()
+	store := newMockStore()
+	layer := ocispec.Descriptor{
+		MediaType: mediaTypeSigstoreBundle03,
+		Digest:    digest.FromBytes(bundleBytes),
+		Size:      int64(len(bundleBytes)),
+	}
+	store.addBlob(testBundleRepo, layer, bundleBytes)
+
+	subjectDesc := ocispec.Descriptor{
+		MediaType: ocispec.MediaTypeImageManifest,
+		Digest:    subject,
+		Size:      1234,
+	}
+	manifest := ocispec.Manifest{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: ArtifactTypeSigstoreBundle,
+		Config:       ocispec.DescriptorEmptyJSON,
+		Layers:       []ocispec.Descriptor{layer},
+		Subject:      &subjectDesc,
+		Annotations:  annotations,
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("failed to marshal manifest: %v", err)
+	}
+	artifactDesc := ocispec.Descriptor{
+		MediaType:    ocispec.MediaTypeImageManifest,
+		ArtifactType: ArtifactTypeSigstoreBundle,
+		Digest:       digest.FromBytes(manifestBytes),
+		Size:         int64(len(manifestBytes)),
+		Annotations:  annotations,
+	}
+	store.addManifest(testBundleRepo, artifactDesc, manifestBytes)
+
+	return &ratify.VerifyOptions{
+		Store:              store,
+		Repository:         testBundleRepo,
+		SubjectDescriptor:  subjectDesc,
+		ArtifactDescriptor: artifactDesc,
+	}
+}
+
+// signAnnotations returns the manifest annotations cosign sets for signatures.
+func signAnnotations() map[string]string {
+	return map[string]string{AnnotationKeyBundlePredicateType: PredicateTypeCosignSign}
+}
+
+// newKeyBundleVerifier creates a key-based verifier for offline bundles.
+func newKeyBundleVerifier(t *testing.T, configs ...*PublicKeyConfig) *Verifier {
+	t.Helper()
+	v, err := NewVerifier(&VerifierOptions{
+		Name:                     "test-verifier",
+		TrustedRoot:              &root.TrustedRoot{},
+		GetPublicKeys:            (&testTrustedPublicKeys{configs: configs}).GetPublicKeys,
+		IdentityPolicies:         []verify.PolicyOption{verify.WithKey()},
+		IgnoreTLog:               true,
+		IgnoreObserverTimestamps: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to create verifier: %v", err)
+	}
+	return v
+}
+
+// bundleReports returns the layer reports of a verification result.
+func bundleReports(t *testing.T, result *ratify.VerificationResult) []*layerReport {
+	t.Helper()
+	detail, ok := result.Detail.(map[string][]*layerReport)
+	if !ok {
+		t.Fatalf("unexpected detail type %T", result.Detail)
+	}
+	return detail["verifiedSignatures"]
+}
+
+// verifyBundle runs the verifier and checks the outcome. If wantErr is empty,
+// verification must succeed; otherwise the single layer report must contain
+// wantErr.
+func verifyBundle(t *testing.T, v *Verifier, opts *ratify.VerifyOptions, wantErr string) *ratify.VerificationResult {
+	t.Helper()
+	result, err := v.Verify(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("unexpected error during verification: %v", err)
+	}
+	reports := bundleReports(t, result)
+	if len(reports) != 1 {
+		t.Fatalf("expected 1 layer report, got %d", len(reports))
+	}
+	report := reports[0]
+	if wantErr == "" {
+		if result.Err != nil || !report.Succeeded {
+			t.Fatalf("expected verification to succeed, got: %v (report error: %v)", result.Err, report.Error)
+		}
+		if result.Description != "Cosign signature verification succeeded" {
+			t.Errorf("unexpected description: %s", result.Description)
+		}
+		if report.VerificationResult == nil || report.VerificationResult.Statement == nil {
+			t.Fatalf("expected verification result with statement")
+		}
+		if got := report.VerificationResult.Statement.GetPredicateType(); got != PredicateTypeCosignSign {
+			t.Errorf("unexpected predicate type %q", got)
+		}
+		return result
+	}
+	if result.Err == nil || report.Succeeded {
+		t.Fatalf("expected verification to fail with %q, but it succeeded", wantErr)
+	}
+	if report.Error == nil || !strings.Contains(report.Error.Error(), wantErr) {
+		t.Fatalf("expected error containing %q, got: %v", wantErr, report.Error)
+	}
+	if result.Description != "Cosign signature verification failed: no valid signatures found" {
+		t.Errorf("unexpected description: %s", result.Description)
+	}
+	return result
+}
+
+func TestVerifier_VerifyBundle_KeyBased(t *testing.T) {
+	tests := []struct {
+		name       string
+		curve      elliptic.Curve
+		subjectAlg digest.Algorithm
+	}{
+		{name: "P-256 key with sha256 subject", curve: elliptic.P256(), subjectAlg: digest.SHA256},
+		{name: "P-384 key with sha256 subject", curve: elliptic.P384(), subjectAlg: digest.SHA256},
+		{name: "P-521 key with sha256 subject", curve: elliptic.P521(), subjectAlg: digest.SHA256},
+		{name: "P-256 key with sha512 subject", curve: elliptic.P256(), subjectAlg: digest.SHA512},
+		{name: "P-384 key with sha512 subject", curve: elliptic.P384(), subjectAlg: digest.SHA512},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			priv := generateECDSAKey(t, tt.curve)
+			subject := tt.subjectAlg.FromString("image manifest")
+			statement := newInTotoStatement(t, PredicateTypeCosignSign, subject)
+			pb := newKeyDSSEBundle(t, priv, defaultHashForCurve(tt.curve), payloadTypeInToto, statement)
+			opts := newBundleVerifyOptions(t, marshalTestBundle(t, pb), subject, signAnnotations())
+
+			v := newKeyBundleVerifier(t, &PublicKeyConfig{PublicKey: &priv.PublicKey})
+			verifyBundle(t, v, opts, "")
+		})
+	}
+}
+
+func TestVerifier_VerifyBundle_KeyBasedHashSelection(t *testing.T) {
+	subject := digest.FromString("image manifest")
+	statement := newInTotoStatement(t, PredicateTypeCosignSign, subject)
+
+	tests := []struct {
+		name       string
+		curve      elliptic.Curve
+		signHash   crypto.Hash
+		configHash crypto.Hash
+		wantErr    string
+	}{
+		{
+			name:       "P-384 default hash accepted with explicit SHA256 config",
+			curve:      elliptic.P384(),
+			signHash:   crypto.SHA384,
+			configHash: crypto.SHA256,
+		},
+		{
+			name:       "P-256 explicit SHA256 config",
+			curve:      elliptic.P256(),
+			signHash:   crypto.SHA256,
+			configHash: crypto.SHA256,
+		},
+		{
+			name:       "P-256 signed with configured SHA512",
+			curve:      elliptic.P256(),
+			signHash:   crypto.SHA512,
+			configHash: crypto.SHA512,
+		},
+		{
+			name:     "P-256 signed with SHA512 without config is rejected",
+			curve:    elliptic.P256(),
+			signHash: crypto.SHA512,
+			wantErr:  "failed to verify signature",
+		},
+		{
+			name:     "P-384 signed with SHA256 without config is rejected",
+			curve:    elliptic.P384(),
+			signHash: crypto.SHA256,
+			wantErr:  "failed to verify signature",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			priv := generateECDSAKey(t, tt.curve)
+			pb := newKeyDSSEBundle(t, priv, tt.signHash, payloadTypeInToto, statement)
+			opts := newBundleVerifyOptions(t, marshalTestBundle(t, pb), subject, signAnnotations())
+
+			v := newKeyBundleVerifier(t, &PublicKeyConfig{
+				PublicKey:          &priv.PublicKey,
+				SignatureAlgorithm: tt.configHash,
+			})
+			verifyBundle(t, v, opts, tt.wantErr)
+		})
+	}
+}
+
+func TestVerifier_VerifyBundle_MultipleKeys(t *testing.T) {
+	subject := digest.FromString("image manifest")
+	statement := newInTotoStatement(t, PredicateTypeCosignSign, subject)
+	other := generateECDSAKey(t, elliptic.P256())
+	signer := generateECDSAKey(t, elliptic.P384())
+	pb := newKeyDSSEBundle(t, signer, crypto.SHA384, payloadTypeInToto, statement)
+	bundleBytes := marshalTestBundle(t, pb)
+
+	t.Run("signing key is not the first key", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, bundleBytes, subject, signAnnotations())
+		v := newKeyBundleVerifier(t,
+			&PublicKeyConfig{PublicKey: &other.PublicKey},
+			&PublicKeyConfig{PublicKey: &signer.PublicKey},
+		)
+		verifyBundle(t, v, opts, "")
+	})
+
+	t.Run("no matching key", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, bundleBytes, subject, signAnnotations())
+		another := generateECDSAKey(t, elliptic.P384())
+		v := newKeyBundleVerifier(t,
+			&PublicKeyConfig{PublicKey: &other.PublicKey},
+			&PublicKeyConfig{PublicKey: &another.PublicKey},
+		)
+		verifyBundle(t, v, opts, "failed to verify signature")
+	})
+}
+
+func TestVerifier_VerifyBundle_KeyBasedFailures(t *testing.T) {
+	signer := generateECDSAKey(t, elliptic.P256())
+	subject := digest.FromString("image manifest")
+	signStatement := newInTotoStatement(t, PredicateTypeCosignSign, subject)
+
+	tests := []struct {
+		name          string
+		bundleBytes   func(t *testing.T) []byte
+		verifySubject digest.Digest
+		trustedKey    crypto.PublicKey
+		wantErr       string
+	}{
+		{
+			name: "wrong key",
+			bundleBytes: func(t *testing.T) []byte {
+				return marshalTestBundle(t, newKeyDSSEBundle(t, signer, crypto.SHA256, payloadTypeInToto, signStatement))
+			},
+			trustedKey: &generateECDSAKey(t, elliptic.P256()).PublicKey,
+			wantErr:    "failed to verify signature",
+		},
+		{
+			name: "subject digest mismatch",
+			bundleBytes: func(t *testing.T) []byte {
+				return marshalTestBundle(t, newKeyDSSEBundle(t, signer, crypto.SHA256, payloadTypeInToto, signStatement))
+			},
+			verifySubject: digest.FromString("another image manifest"),
+			wantErr:       "does not match",
+		},
+		{
+			name: "subject digest algorithm mismatch",
+			bundleBytes: func(t *testing.T) []byte {
+				return marshalTestBundle(t, newKeyDSSEBundle(t, signer, crypto.SHA256, payloadTypeInToto, signStatement))
+			},
+			verifySubject: digest.SHA512.FromString("image manifest"),
+			wantErr:       "does not match",
+		},
+		{
+			name: "attestation with spoofed sign annotation",
+			bundleBytes: func(t *testing.T) []byte {
+				statement := newInTotoStatement(t, testPredicateTypeSLSA, subject)
+				return marshalTestBundle(t, newKeyDSSEBundle(t, signer, crypto.SHA256, payloadTypeInToto, statement))
+			},
+			wantErr: `bundle is not a cosign signature: predicateType "https://slsa.dev/provenance/v1"`,
+		},
+		{
+			name: "non in-toto payload type",
+			bundleBytes: func(t *testing.T) []byte {
+				return marshalTestBundle(t, newKeyDSSEBundle(t, signer, crypto.SHA256, "application/json", signStatement))
+			},
+			wantErr: "unsupported DSSE payload type",
+		},
+		{
+			name: "message signature bundle",
+			bundleBytes: func(t *testing.T) []byte {
+				d := sha256Sum(signStatement)
+				sig, err := ecdsa.SignASN1(rand.Reader, signer, d)
+				if err != nil {
+					t.Fatalf("failed to sign: %v", err)
+				}
+				pb := newKeyDSSEBundle(t, signer, crypto.SHA256, payloadTypeInToto, signStatement)
+				pb.Content = &protobundle.Bundle_MessageSignature{
+					MessageSignature: &protocommon.MessageSignature{
+						MessageDigest: &protocommon.HashOutput{
+							Algorithm: protocommon.HashAlgorithm_SHA2_256,
+							Digest:    d,
+						},
+						Signature: sig,
+					},
+				}
+				return marshalTestBundle(t, pb)
+			},
+			wantErr: "bundle content is not a DSSE envelope",
+		},
+		{
+			name: "bundle version older than v0.3",
+			bundleBytes: func(t *testing.T) []byte {
+				pb := newKeyDSSEBundle(t, signer, crypto.SHA256, payloadTypeInToto, signStatement)
+				pb.MediaType = "application/vnd.dev.sigstore.bundle+json;version=0.2"
+				return marshalTestBundle(t, pb)
+			},
+			wantErr: "bundle version must be v0.3 or later",
+		},
+		{
+			name: "invalid bundle JSON",
+			bundleBytes: func(t *testing.T) []byte {
+				return []byte("{not json")
+			},
+			wantErr: "failed to unmarshal bundle",
+		},
+		{
+			name: "bundle without verification material",
+			bundleBytes: func(t *testing.T) []byte {
+				pb := newKeyDSSEBundle(t, signer, crypto.SHA256, payloadTypeInToto, signStatement)
+				pb.VerificationMaterial = nil
+				return marshalTestBundle(t, pb)
+			},
+			wantErr: "invalid bundle",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verifySubject := subject
+			if tt.verifySubject != "" {
+				verifySubject = tt.verifySubject
+			}
+			trustedKey := tt.trustedKey
+			if trustedKey == nil {
+				trustedKey = &signer.PublicKey
+			}
+			opts := newBundleVerifyOptions(t, tt.bundleBytes(t), verifySubject, signAnnotations())
+			v := newKeyBundleVerifier(t, &PublicKeyConfig{PublicKey: trustedKey})
+			verifyBundle(t, v, opts, tt.wantErr)
+		})
+	}
+}
+
+func sha256Sum(b []byte) []byte {
+	h := crypto.SHA256.New()
+	h.Write(b)
+	return h.Sum(nil)
+}
+
+func TestVerifier_VerifyBundle_Errors(t *testing.T) {
+	ctx := context.Background()
+	signer := generateECDSAKey(t, elliptic.P256())
+	subject := digest.FromString("image manifest")
+	statement := newInTotoStatement(t, PredicateTypeCosignSign, subject)
+	bundleBytes := marshalTestBundle(t, newKeyDSSEBundle(t, signer, crypto.SHA256, payloadTypeInToto, statement))
+	keyConfig := &PublicKeyConfig{PublicKey: &signer.PublicKey}
+
+	t.Run("routes by manifest artifact type", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, bundleBytes, subject, nil)
+		manifestBytes, err := opts.Store.FetchManifest(ctx, opts.Repository, opts.ArtifactDescriptor)
+		if err != nil {
+			t.Fatalf("failed to fetch manifest: %v", err)
+		}
+		opts.ArtifactDescriptor.ArtifactType = mediaTypeCosignArtifactSignature
+		opts.Store.(*mockStore).addManifest(opts.Repository, opts.ArtifactDescriptor, manifestBytes)
+		verifyBundle(t, newKeyBundleVerifier(t, keyConfig), opts, "")
+	})
+
+	t.Run("no bundle layer", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, bundleBytes, subject, nil)
+		manifest := ocispec.Manifest{
+			Versioned:    specs.Versioned{SchemaVersion: 2},
+			MediaType:    ocispec.MediaTypeImageManifest,
+			ArtifactType: ArtifactTypeSigstoreBundle,
+			Config:       ocispec.DescriptorEmptyJSON,
+			Layers:       []ocispec.Descriptor{ocispec.DescriptorEmptyJSON},
+		}
+		manifestBytes, err := json.Marshal(manifest)
+		if err != nil {
+			t.Fatalf("failed to marshal manifest: %v", err)
+		}
+		opts.Store.(*mockStore).addManifest(opts.Repository, opts.ArtifactDescriptor, manifestBytes)
+		_, err = newKeyBundleVerifier(t, keyConfig).Verify(ctx, opts)
+		if err == nil || !strings.Contains(err.Error(), "no Sigstore bundle layer found") {
+			t.Fatalf("expected missing bundle layer error, got: %v", err)
+		}
+	})
+
+	t.Run("unexpected manifest media type", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, bundleBytes, subject, nil)
+		manifestBytes, err := json.Marshal(ocispec.Index{
+			Versioned:    specs.Versioned{SchemaVersion: 2},
+			MediaType:    ocispec.MediaTypeImageIndex,
+			ArtifactType: ArtifactTypeSigstoreBundle,
+		})
+		if err != nil {
+			t.Fatalf("failed to marshal index: %v", err)
+		}
+		opts.Store.(*mockStore).addManifest(opts.Repository, opts.ArtifactDescriptor, manifestBytes)
+		_, err = newKeyBundleVerifier(t, keyConfig).Verify(ctx, opts)
+		if err == nil || !strings.Contains(err.Error(), "expected media type") {
+			t.Fatalf("expected media type error, got: %v", err)
+		}
+	})
+
+	t.Run("bundle blob not found", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, bundleBytes, subject, nil)
+		opts.Store.(*mockStore).blobs = map[string][]byte{}
+		verifyBundle(t, newKeyBundleVerifier(t, keyConfig), opts, "failed to fetch bundle")
+	})
+
+	t.Run("bundle layer too large", func(t *testing.T) {
+		large := make([]byte, maxBundleSize+1)
+		opts := newBundleVerifyOptions(t, large, subject, nil)
+		verifyBundle(t, newKeyBundleVerifier(t, keyConfig), opts, "exceeds the limit")
+
+		// The descriptor size understates the actual blob size.
+		var manifest ocispec.Manifest
+		manifestBytes, err := opts.Store.FetchManifest(ctx, opts.Repository, opts.ArtifactDescriptor)
+		if err != nil {
+			t.Fatalf("failed to fetch manifest: %v", err)
+		}
+		if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+			t.Fatalf("failed to unmarshal manifest: %v", err)
+		}
+		manifest.Layers[0].Size = 1
+		manifestBytes, err = json.Marshal(manifest)
+		if err != nil {
+			t.Fatalf("failed to marshal manifest: %v", err)
+		}
+		opts.Store.(*mockStore).addManifest(opts.Repository, opts.ArtifactDescriptor, manifestBytes)
+		verifyBundle(t, newKeyBundleVerifier(t, keyConfig), opts, "exceeds the limit")
+	})
+
+	t.Run("unsupported subject digest algorithm", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, bundleBytes, digest.SHA384.FromString("image manifest"), nil)
+		verifyBundle(t, newKeyBundleVerifier(t, keyConfig), opts, "unsupported subject digest algorithm")
+	})
+
+	t.Run("invalid subject digest", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, bundleBytes, subject, nil)
+		opts.SubjectDescriptor.Digest = "sha256:invalid"
+		verifyBundle(t, newKeyBundleVerifier(t, keyConfig), opts, "invalid subject digest")
+	})
+
+	t.Run("public keys unavailable", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, bundleBytes, subject, nil)
+		v, err := NewVerifier(&VerifierOptions{
+			Name:          "test-verifier",
+			TrustedRoot:   &root.TrustedRoot{},
+			GetPublicKeys: (&testTrustedPublicKeys{err: fmt.Errorf("key provider unavailable")}).GetPublicKeys,
+		})
+		if err != nil {
+			t.Fatalf("failed to create verifier: %v", err)
+		}
+		verifyBundle(t, v, opts, "key provider unavailable")
+	})
+
+	t.Run("observer timestamp required", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, bundleBytes, subject, nil)
+		v, err := NewVerifier(&VerifierOptions{
+			Name:             "test-verifier",
+			TrustedRoot:      &root.TrustedRoot{},
+			GetPublicKeys:    (&testTrustedPublicKeys{configs: []*PublicKeyConfig{keyConfig}}).GetPublicKeys,
+			IdentityPolicies: []verify.PolicyOption{verify.WithKey()},
+			IgnoreTLog:       true,
+		})
+		if err != nil {
+			t.Fatalf("failed to create verifier: %v", err)
+		}
+		verifyBundle(t, v, opts, "timestamp")
+	})
+
+	t.Run("transparency log required", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, bundleBytes, subject, nil)
+		v, err := NewVerifier(&VerifierOptions{
+			Name:                     "test-verifier",
+			TrustedRoot:              &root.TrustedRoot{},
+			GetPublicKeys:            (&testTrustedPublicKeys{configs: []*PublicKeyConfig{keyConfig}}).GetPublicKeys,
+			IdentityPolicies:         []verify.PolicyOption{verify.WithKey()},
+			IgnoreObserverTimestamps: true,
+		})
+		if err != nil {
+			t.Fatalf("failed to create verifier: %v", err)
+		}
+		verifyBundle(t, v, opts, "log")
+	})
+}
+
+// newVirtualSigstoreTrustedRoot creates a trusted root from the virtual
+// Sigstore instance.
+func newVirtualSigstoreTrustedRoot(t *testing.T, vs *ca.VirtualSigstore) *root.TrustedRoot {
+	t.Helper()
+	trustedRoot, err := root.NewTrustedRoot(root.TrustedRootMediaType01,
+		vs.FulcioCertificateAuthorities(), vs.CTLogs(), vs.TimestampingAuthorities(), vs.RekorLogs())
+	if err != nil {
+		t.Fatalf("failed to create trusted root: %v", err)
+	}
+	return trustedRoot
+}
+
+func TestVerifier_VerifyBundle_Keyless(t *testing.T) {
+	vs, err := ca.NewVirtualSigstore()
+	if err != nil {
+		t.Fatalf("failed to create virtual sigstore: %v", err)
+	}
+	trustedRoot := newVirtualSigstoreTrustedRoot(t, vs)
+	subject := digest.FromString("image manifest")
+
+	newKeylessVerifier := func(t *testing.T, identity string, ignoreTLog bool) *Verifier {
+		t.Helper()
+		certIdentity, err := verify.NewShortCertificateIdentity(testBundleIssuer, "", identity, "")
+		if err != nil {
+			t.Fatalf("failed to create certificate identity: %v", err)
+		}
+		v, err := NewVerifier(&VerifierOptions{
+			Name:             "test-verifier",
+			TrustedRoot:      trustedRoot,
+			IdentityPolicies: []verify.PolicyOption{verify.WithCertificateIdentity(certIdentity)},
+			IgnoreTLog:       ignoreTLog,
+			IgnoreCTLog:      true,
+		})
+		if err != nil {
+			t.Fatalf("failed to create verifier: %v", err)
+		}
+		return v
+	}
+
+	signBundle := marshalTestBundle(t, newKeylessDSSEBundle(t, vs, testBundleIdentity, testBundleIssuer,
+		newInTotoStatement(t, PredicateTypeCosignSign, subject)))
+	attestationBundle := marshalTestBundle(t, newKeylessDSSEBundle(t, vs, testBundleIdentity, testBundleIssuer,
+		newInTotoStatement(t, testPredicateTypeSLSA, subject)))
+
+	tests := []struct {
+		name          string
+		bundleBytes   []byte
+		identity      string
+		ignoreTLog    bool
+		verifySubject digest.Digest
+		wantErr       string
+	}{
+		{
+			name:        "valid signature with transparency log",
+			bundleBytes: signBundle,
+			identity:    testBundleIdentity,
+		},
+		{
+			name:        "valid signature ignoring transparency log",
+			bundleBytes: signBundle,
+			identity:    testBundleIdentity,
+			ignoreTLog:  true,
+		},
+		{
+			name:        "wrong identity",
+			bundleBytes: signBundle,
+			identity:    "someone-else@example.com",
+			wantErr:     "failed to verify certificate identity",
+		},
+		{
+			name:          "subject digest mismatch",
+			bundleBytes:   signBundle,
+			identity:      testBundleIdentity,
+			verifySubject: digest.FromString("another image manifest"),
+			wantErr:       "does not match",
+		},
+		{
+			name:        "attestation with spoofed sign annotation",
+			bundleBytes: attestationBundle,
+			identity:    testBundleIdentity,
+			wantErr:     "bundle is not a cosign signature",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			verifySubject := subject
+			if tt.verifySubject != "" {
+				verifySubject = tt.verifySubject
+			}
+			opts := newBundleVerifyOptions(t, tt.bundleBytes, verifySubject, signAnnotations())
+			result := verifyBundle(t, newKeylessVerifier(t, tt.identity, tt.ignoreTLog), opts, tt.wantErr)
+			if tt.wantErr == "" {
+				res := bundleReports(t, result)[0].VerificationResult
+				if res.VerifiedIdentity == nil {
+					t.Errorf("expected verified identity")
+				}
+			}
+		})
+	}
+
+	t.Run("key-based verifier rejects certificate bundle", func(t *testing.T) {
+		opts := newBundleVerifyOptions(t, signBundle, subject, signAnnotations())
+		key := generateECDSAKey(t, elliptic.P256())
+		verifyBundle(t, newKeyBundleVerifier(t, &PublicKeyConfig{PublicKey: &key.PublicKey}), opts,
+			"key-based verification requires a bundle signed with a public key")
+	})
+
+	t.Run("keyless verifier rejects public key bundle", func(t *testing.T) {
+		key := generateECDSAKey(t, elliptic.P256())
+		pb := newKeyDSSEBundle(t, key, crypto.SHA256, payloadTypeInToto, newInTotoStatement(t, PredicateTypeCosignSign, subject))
+		opts := newBundleVerifyOptions(t, marshalTestBundle(t, pb), subject, signAnnotations())
+		verifyBundle(t, newKeylessVerifier(t, testBundleIdentity, true), opts, "failed to verify")
+	})
+}
+
+func TestVerifier_BundleVerifiersFallback(t *testing.T) {
+	t.Run("uses getVerifier", func(t *testing.T) {
+		v := &Verifier{getVerifier: func() (*verify.Verifier, error) {
+			return &verify.Verifier{}, nil
+		}}
+		verifiers, err := v.bundleVerifiers()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(verifiers) != 1 {
+			t.Fatalf("expected 1 verifier, got %d", len(verifiers))
+		}
+	})
+
+	t.Run("getVerifier error", func(t *testing.T) {
+		v := &Verifier{getVerifier: func() (*verify.Verifier, error) {
+			return nil, fmt.Errorf("verifier unavailable")
+		}}
+		if _, err := v.bundleVerifiers(); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+}
+
+func TestCreateBundleKeyVerifiers_Errors(t *testing.T) {
+	_, publicKey, err := generateTestKey()
+	if err != nil {
+		t.Fatalf("failed to generate test key: %v", err)
+	}
+	tests := []struct {
+		name    string
+		opts    *VerifierOptions
+		wantErr string
+	}{
+		{
+			name: "no public keys",
+			opts: &VerifierOptions{
+				TrustedRoot:   &root.TrustedRoot{},
+				GetPublicKeys: (&testTrustedPublicKeys{}).GetPublicKeys,
+			},
+			wantErr: "no public keys configured",
+		},
+		{
+			name: "nil public key config",
+			opts: &VerifierOptions{
+				TrustedRoot:   &root.TrustedRoot{},
+				GetPublicKeys: (&testTrustedPublicKeys{configs: []*PublicKeyConfig{nil}}).GetPublicKeys,
+			},
+			wantErr: "public key config cannot be nil",
+		},
+		{
+			name: "TUF client creation error",
+			opts: &VerifierOptions{
+				GetPublicKeys: (&testTrustedPublicKeys{configs: []*PublicKeyConfig{{PublicKey: publicKey}}}).GetPublicKeys,
+				TUFOptions:    &tuf.Options{RepositoryBaseURL: "invalid-url"},
+			},
+			wantErr: "failed to create TUF client",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := createBundleKeyVerifiers(tt.opts)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("expected error containing %q, got: %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestLoadBundleKeyVerifier(t *testing.T) {
+	p256 := generateECDSAKey(t, elliptic.P256())
+
+	t.Run("nil keys", func(t *testing.T) {
+		for name, key := range map[string]crypto.PublicKey{
+			"nil":             nil,
+			"typed-nil ecdsa": (*ecdsa.PublicKey)(nil),
+			"typed-nil rsa":   (*rsa.PublicKey)(nil),
+			"empty ed25519":   ed25519.PublicKey(nil),
+		} {
+			for _, hash := range []crypto.Hash{0, crypto.SHA256} {
+				if _, err := loadBundleKeyVerifier(key, hash); err == nil {
+					t.Fatalf("%s with hash %v: expected error", name, hash)
+				}
+			}
+		}
+	})
+
+	t.Run("invalid key", func(t *testing.T) {
+		if _, err := loadBundleKeyVerifier("invalid-key", 0); err == nil {
+			t.Fatalf("expected error")
+		}
+		if _, err := loadBundleKeyVerifier("invalid-key", crypto.SHA256); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+
+	t.Run("default hash only", func(t *testing.T) {
+		v, err := loadBundleKeyVerifier(&p256.PublicKey, crypto.SHA256)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if _, ok := v.(*multiHashVerifier); ok {
+			t.Fatalf("expected a single-hash verifier")
+		}
+	})
+
+	t.Run("default and configured hash", func(t *testing.T) {
+		v, err := loadBundleKeyVerifier(&p256.PublicKey, crypto.SHA512)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		multi, ok := v.(*multiHashVerifier)
+		if !ok {
+			t.Fatalf("expected a multi-hash verifier, got %T", v)
+		}
+		pub, err := multi.PublicKey()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !p256.PublicKey.Equal(pub) {
+			t.Fatalf("unexpected public key")
+		}
+
+		message := []byte("message")
+		for _, hash := range []crypto.Hash{crypto.SHA256, crypto.SHA512} {
+			h := hash.New()
+			h.Write(message)
+			sig, err := ecdsa.SignASN1(rand.Reader, p256, h.Sum(nil))
+			if err != nil {
+				t.Fatalf("failed to sign: %v", err)
+			}
+			if err := multi.VerifySignature(strings.NewReader(string(sig)), strings.NewReader(string(message))); err != nil {
+				t.Errorf("expected %v signature to verify: %v", hash, err)
+			}
+		}
+
+		h := crypto.SHA384.New()
+		h.Write(message)
+		sig, err := ecdsa.SignASN1(rand.Reader, p256, h.Sum(nil))
+		if err != nil {
+			t.Fatalf("failed to sign: %v", err)
+		}
+		if err := multi.VerifySignature(strings.NewReader(string(sig)), strings.NewReader(string(message))); err == nil {
+			t.Errorf("expected SHA384 signature to be rejected")
+		}
+	})
+}
+
+func TestMultiHashVerifier_ReadErrors(t *testing.T) {
+	p256 := generateECDSAKey(t, elliptic.P256())
+	v256, err := signature.LoadVerifier(&p256.PublicKey, crypto.SHA256)
+	if err != nil {
+		t.Fatalf("failed to load verifier: %v", err)
+	}
+	multi := &multiHashVerifier{verifiers: []signature.Verifier{v256}}
+	if err := multi.VerifySignature(errReader{}, strings.NewReader("message")); err == nil {
+		t.Errorf("expected signature read error")
+	}
+	if err := multi.VerifySignature(strings.NewReader("sig"), errReader{}); err == nil {
+		t.Errorf("expected message read error")
+	}
+	if err := multi.VerifySignature(strings.NewReader("sig"), nil); err == nil {
+		t.Errorf("expected verification error without message")
+	}
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) {
+	return 0, fmt.Errorf("read error")
+}
+
+func TestCreateTrustedMaterialFromPublicKeys_DoesNotMutateConfig(t *testing.T) {
+	_, publicKey, err := generateTestKey()
+	if err != nil {
+		t.Fatalf("failed to generate test key: %v", err)
+	}
+	config := &PublicKeyConfig{PublicKey: publicKey}
+	getPublicKeys := (&testTrustedPublicKeys{configs: []*PublicKeyConfig{config}}).GetPublicKeys
+	if _, err := createTrustedMaterialFromPublicKeys(context.Background(), getPublicKeys); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if config.SignatureAlgorithm != 0 {
+		t.Errorf("expected config to be unchanged, got signature algorithm %v", config.SignatureAlgorithm)
 	}
 }
